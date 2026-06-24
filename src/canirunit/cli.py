@@ -1,6 +1,6 @@
 """Command-line interface: the specific-model-check flow (v1 MVP).
 
-    llmfit check <repo_id> [--quant Q4_K_M] [--ctx N] [--calibrate]
+    canirunit check <repo_id> [--quant Q4_K_M] [--ctx N] [--calibrate]
 
 Wires detect -> hub.fetch_model -> optional calibrate -> estimate, then renders a
 verdict. The renderer is pure and tested; the orchestration takes injectable
@@ -45,7 +45,7 @@ def format_report(
     calib_note: Optional[str] = None,
 ) -> str:
     L: list[str] = []
-    L.append(f"llmfit — {spec.repo_id}  ({spec.quant})")
+    L.append(f"canirunit — {spec.repo_id}  ({spec.quant})")
     basis = (
         "Metal working set" if profile.metal_max_working_set_bytes is not None
         else "free VRAM" if profile.accelerator == "cuda"
@@ -148,7 +148,7 @@ def run_check(
 # Argument parsing / entry point
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="llmfit", description="Estimate whether a local GGUF model fits and runs well on this machine.")
+    p = argparse.ArgumentParser(prog="canirunit", description="Estimate whether a local GGUF model fits and runs well on this machine.")
     sub = p.add_subparsers(dest="command", required=True)
 
     check = sub.add_parser("check", help="Check a specific model by Hugging Face repo id.")
@@ -165,12 +165,12 @@ def main(argv: Optional[list] = None) -> int:
         try:
             report = run_check(args.model, quant=args.quant, ctx=args.ctx, do_calibrate=args.calibrate)
         except (ValueError, KeyError) as e:
-            print(f"llmfit: {e}", file=sys.stderr)
+            print(f"canirunit: {e}", file=sys.stderr)
             return 1
         except (OSError, requests.exceptions.RequestException) as e:
             # HF HTTP errors subclass OSError (httpx); our range reader uses requests.
             print(
-                f"llmfit: could not fetch '{args.model}' from Hugging Face. "
+                f"canirunit: could not fetch '{args.model}' from Hugging Face. "
                 f"Check the repo id, quant tag, and your connection.\n  ({e})",
                 file=sys.stderr,
             )

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from llmfit import EstimatorConfig, ModelSpec, SystemProfile
-from llmfit.benchmark import (
+from canirunit import EstimatorConfig, ModelSpec, SystemProfile
+from canirunit.benchmark import (
     BenchResult,
     calibration_from_bench,
     find_runtime,
@@ -13,7 +13,7 @@ from llmfit.benchmark import (
     parse_llama_bench_text,
     parse_ollama_verbose,
 )
-from llmfit.estimator import decode_tok_s, prefill_tok_s
+from canirunit.estimator import decode_tok_s, prefill_tok_s
 
 GiB = 1024 ** 3
 

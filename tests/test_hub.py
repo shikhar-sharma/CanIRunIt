@@ -4,9 +4,9 @@ from __future__ import annotations
 import pytest
 
 from ggufkit import ARRAY, STRING, U32, U64, build_gguf
-from llmfit import SystemProfile, estimate
-from llmfit.gguf import BytesReader, parse_gguf
-from llmfit.hub import build_model_spec, select_quant_files
+from canirunit import SystemProfile, estimate
+from canirunit.gguf import BytesReader, parse_gguf
+from canirunit.hub import build_model_spec, select_quant_files
 
 GiB = 1024 ** 3
 

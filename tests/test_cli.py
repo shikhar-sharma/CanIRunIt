@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from llmfit import Calibration, ModelSpec, SystemProfile
-from llmfit.cli import build_parser, run_check
+from canirunit import Calibration, ModelSpec, SystemProfile
+from canirunit.cli import build_parser, run_check
 
 GiB = 1024 ** 3
 

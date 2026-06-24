@@ -7,7 +7,7 @@ import math
 
 import pytest
 
-from llmfit import (
+from canirunit import (
     Calibration,
     EstimatorConfig,
     ModelSpec,
@@ -18,7 +18,7 @@ from llmfit import (
     kv_cache_bytes,
     max_ctx_that_fits,
 )
-from llmfit.estimator import usable_memory_bytes
+from canirunit.estimator import usable_memory_bytes
 
 GiB = 1024 ** 3
 

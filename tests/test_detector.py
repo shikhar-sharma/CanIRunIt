@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from llmfit.detector import (
+from canirunit.detector import (
     AppleBackend,
     CpuBackend,
     NvidiaBackend,
@@ -101,7 +101,7 @@ def test_apple_unknown_chip_falls_back_and_is_flagged():
 # NVIDIA probe
 # --------------------------------------------------------------------------- #
 def test_nvidia_probe_via_fake_runner():
-    from llmfit.detector import _NVIDIA_QUERY
+    from canirunit.detector import _NVIDIA_QUERY
     runner = fake_runner({tuple(_NVIDIA_QUERY): "NVIDIA GeForce RTX 4090, 24564, 23000\n"})
     p = NvidiaBackend(runner=runner, disk_free=500 * GiB).probe()
     assert p.accelerator == "cuda"

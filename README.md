@@ -1,4 +1,4 @@
-# llmfit
+# canirunit
 
 Estimate whether a local **GGUF** model will fit and run well on your machine —
 before you download gigabytes to find out.
@@ -18,8 +18,8 @@ different reliability:
 Requires Python 3.10+.
 
 ```bash
-git clone <your-repo-url> llmfit
-cd llmfit
+git clone https://github.com/shikhar-sharma/CanIRunIt.git
+cd CanIRunIt
 pip install -e .
 ```
 
@@ -28,14 +28,14 @@ pip install -e .
 Check a specific model by its Hugging Face repo id:
 
 ```bash
-llmfit check bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
-llmfit check bartowski/Meta-Llama-3.1-8B-Instruct-GGUF --quant Q5_K_M --ctx 16384
+canirunit check bartowski/Meta-Llama-3.1-8B-Instruct-GGUF
+canirunit check bartowski/Meta-Llama-3.1-8B-Instruct-GGUF --quant Q5_K_M --ctx 16384
 ```
 
 Example output:
 
 ```
-llmfit — bartowski/Meta-Llama-3.1-8B-Instruct-GGUF  (Q4_K_M)
+canirunit — bartowski/Meta-Llama-3.1-8B-Instruct-GGUF  (Q4_K_M)
 Machine: Apple M1  [apple_metal]  ·  68 GB/s  ·  17.2 GB total, 11.8 GB usable (Metal working set)
 
 FIT
@@ -57,7 +57,7 @@ Speed defaults to a *static estimate* from hardware tables. For numbers measured
 on your actual machine, add `--calibrate`:
 
 ```bash
-llmfit check bartowski/Meta-Llama-3.1-8B-Instruct-GGUF --calibrate
+canirunit check bartowski/Meta-Llama-3.1-8B-Instruct-GGUF --calibrate
 ```
 
 Calibration runs a small model through an existing runtime and backs out your

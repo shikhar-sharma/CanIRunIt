@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from ggufkit import ARRAY, F32, STRING, U32, U64, build_gguf
-from llmfit.gguf import (
+from canirunit.gguf import (
     BytesReader,
     TensorInfo,
     is_expert_tensor,

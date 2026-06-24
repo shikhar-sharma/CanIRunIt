@@ -1,4 +1,4 @@
-"""llmfit — estimate which local GGUF models will fit and run well on a machine."""
+"""canirunit — estimate which local GGUF models will fit and run well on a machine."""
 from __future__ import annotations
 
 from .config import EstimatorConfig
