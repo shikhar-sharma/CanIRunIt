@@ -10,8 +10,9 @@ from typing import Literal, Optional
 
 Accelerator = Literal["apple_metal", "cuda", "cpu"]
 KVQuant = Literal["f16", "q8", "q4"]
-BenchSource = Literal["llama-bench", "ollama", "static"]
+BenchSource = Literal["llama-bench", "ollama", "mlx_lm", "static"]
 Confidence = Literal["measured", "estimated"]
+Runtime = Literal["gguf", "mlx", "ollama"]
 
 
 @dataclass(frozen=True)
@@ -60,6 +61,20 @@ class ModelSpec:
     # not apply, so the estimator flags rather than lies.
     kv_is_standard: bool = True
 
+    # Which runtime family this spec came from. The estimator math is identical
+    # across runtimes; this carries provenance for the calibration runtime-guard
+    # and for the comparison renderer.
+    runtime: Runtime = "gguf"
+    # KV element size in bytes the runtime would use natively. Defaulted to f16
+    # (2.0) for ALL runtimes in v2 — i.e. introduces no number changes. Seam for
+    # a future, measurement-backed per-runtime KV policy. Do not set anything
+    # other than 2.0 without a measurement.
+    default_kv_bytes_per_element: float = 2.0
+    # Human-facing quant description as the runtime expresses it. GGUF: "Q4_K_M".
+    # MLX: "4bit-g64". Ollama: inherits the underlying GGUF's label. None means
+    # "use the legacy `quant` field for display."
+    quant_label: Optional[str] = None
+
     @property
     def decode_active_params(self) -> int:
         """Param count that governs decode/prefill compute: active experts for
@@ -92,6 +107,11 @@ class FitResult:
     storage_ok: bool
     kv_quant_suggestion: Optional[str] = None  # "q8 KV cache reaches native context ..."
     notes: list[str] = field(default_factory=list)
+    # The "loads at all" ceiling (vs max_ctx_that_fits, the "comfort" ceiling).
+    # Populated by the two-ceiling fit model on Apple, where the wired-memory
+    # limit is soft (swap/compression extends it past the working-set cap).
+    # None when the two-ceiling model isn't applicable or hasn't been computed.
+    hard_max_ctx_that_fits: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -118,3 +138,7 @@ class Calibration:
     measured_on_chip: str
     source: BenchSource
     prefill_flops_per_sec: Optional[float] = None  # prefill anchor (effective FLOP/s)
+    # Which runtime family these constants apply to. Critical guard: a
+    # calibration measured through llama-bench (gguf) must never be applied to
+    # an MLX target. Ollama shares the gguf path so it tags as "gguf".
+    runtime: Runtime = "gguf"

@@ -39,8 +39,10 @@ _SCALAR_FMT = {
 }
 
 # Architectures whose KV cache is compressed (MLA etc.) and so the standard
-# per-head formula does not apply. We flag rather than mis-estimate.
-_NON_STANDARD_KV_ARCHS = {"deepseek2"}
+# per-head formula does not apply. We flag rather than mis-estimate. Includes
+# both the GGUF-side names (deepseek2/3) and the HF-transformers model_type
+# names (deepseek_v2/v3) so MLX configs hit the same flag.
+_NON_STANDARD_KV_ARCHS = {"deepseek2", "deepseek3", "deepseek_v2", "deepseek_v3"}
 
 
 class ByteReader(Protocol):

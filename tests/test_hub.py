@@ -6,7 +6,8 @@ import pytest
 from ggufkit import ARRAY, STRING, U32, U64, build_gguf
 from canirunit import SystemProfile, estimate
 from canirunit.gguf import BytesReader, parse_gguf
-from canirunit.hub import build_model_spec, select_quant_files
+from canirunit.hub import GgufSource, build_model_spec, select_quant_files
+from canirunit.sources import get_source
 
 GiB = 1024 ** 3
 
@@ -203,3 +204,40 @@ def test_end_to_end_spec_feeds_estimator():
     # same machine + same model as the estimator's pinned fixture -> ~8 tok/s at 8k
     at_8k = next(p.decode_tok_s for p in speed.points if p.ctx == 8192)
     assert at_8k == pytest.approx(7.97, abs=0.05)
+
+
+# --------------------------------------------------------------------------- #
+# build_model_spec tags runtime + quant_label
+# --------------------------------------------------------------------------- #
+def test_build_model_spec_tags_gguf_runtime_and_quant_label():
+    spec = _spec_from([
+        ("general.architecture", STRING, "llama"),
+        ("general.parameter_count", U64, 8_030_000_000),
+        ("llama.block_count", U32, 32),
+        ("llama.context_length", U32, 8192),
+        ("llama.embedding_length", U32, 4096),
+        ("llama.attention.head_count", U32, 32),
+        ("llama.attention.head_count_kv", U32, 8),
+        ("llama.attention.key_length", U32, 128),
+        ("llama.attention.value_length", U32, 128),
+    ], quant="Q5_K_M")
+    assert spec.runtime == "gguf"
+    assert spec.quant_label == "Q5_K_M"
+
+
+# --------------------------------------------------------------------------- #
+# SpecSource adapter
+# --------------------------------------------------------------------------- #
+def test_gguf_source_exposes_runtime_attribute():
+    src = GgufSource()
+    assert src.runtime == "gguf"
+
+
+def test_get_source_returns_gguf_source():
+    src = get_source("gguf")
+    assert isinstance(src, GgufSource)
+
+
+def test_get_source_unknown_runtime_raises():
+    with pytest.raises(ValueError, match="unknown runtime"):
+        get_source("notaruntime")  # type: ignore[arg-type]
