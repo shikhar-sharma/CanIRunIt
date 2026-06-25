@@ -326,3 +326,43 @@ def test_run_models_renders_listing():
     ])
     assert "llama-3.1-8b-instruct" in out
     assert "gguf" in out and "mlx" in out
+
+
+# --------------------------------------------------------------------------- #
+# Two-ceiling rendering: only surfaces when the hard ceiling exceeds comfort
+# --------------------------------------------------------------------------- #
+def test_run_check_renders_hard_ceiling_when_higher():
+    """A 13 GB model on a 12 GiB Metal working set: comfort = 0, hard > 0.
+    Renderer should add the 'Loads (with slowdown past wired limit)' line."""
+    big = ModelSpec(
+        repo_id="meta-llama/Big", quant="Q4_K_M",
+        total_weight_bytes=13_000_000_000, active_weight_bytes=13_000_000_000,
+        total_params=20_000_000_000, n_layers=40, n_kv_heads=8,
+        key_length=128, value_length=128, native_ctx=8192, architecture="llama",
+    )
+    report = run_check(
+        "meta-llama/Big",
+        detect_fn=m1_profile,
+        fetch_fn=lambda model, quant: big,
+        calibrate_fn=lambda profile: None,
+    )
+    assert "Loads (with slowdown past wired limit)" in report
+
+
+def test_run_check_omits_hard_ceiling_line_on_cuda():
+    """Hard == comfort on CUDA: no extra line, no surprise."""
+    def cuda_profile():
+        return SystemProfile(
+            total_memory_bytes=64 * GiB, available_memory_bytes=20 * GiB,
+            memory_bandwidth_gbs=900.0, accelerator="cuda", chip_id="NVIDIA RTX 4090",
+            storage_free_bytes=200 * GiB, metal_max_working_set_bytes=None,
+            peak_flops=82e12,
+        )
+
+    report = run_check(
+        "meta-llama/Meta-Llama-3-8B",
+        detect_fn=cuda_profile,
+        fetch_fn=lambda model, quant: llama_spec(),
+        calibrate_fn=lambda profile: None,
+    )
+    assert "Loads (with slowdown" not in report

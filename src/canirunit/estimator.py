@@ -40,19 +40,37 @@ def kv_cache_bytes(spec: ModelSpec, ctx: int, kv_quant: str, config: EstimatorCo
 # Memory budget
 # --------------------------------------------------------------------------- #
 def usable_memory_bytes(profile: SystemProfile, config: EstimatorConfig) -> int:
-    """What we can actually spend on weights + KV + compute buffers.
+    """The COMFORT ceiling: what we can spend without spilling past the wired
+    limit / available cap.
 
     On Apple the Metal working set is the authoritative ceiling: when a model
     loads, macOS reclaims cache/inactive memory up to the wired limit, so the
     *instantaneous* free RAM must NOT cap the budget (otherwise the verdict swings
     with whatever apps happen to be open). Elsewhere — CUDA free VRAM, or CPU
     available RAM — the available figure is the real cap.
+
+    See ``hard_usable_memory_bytes`` for the soft "loads at all" ceiling.
     """
     if profile.metal_max_working_set_bytes is not None:
         cap = profile.metal_max_working_set_bytes
     else:
         cap = profile.available_memory_bytes
     return max(0, cap - config.safety_headroom_bytes)
+
+
+def hard_usable_memory_bytes(profile: SystemProfile, config: EstimatorConfig) -> int:
+    """The HARD "loads at all" ceiling, distinct from the comfort ceiling.
+
+    On Apple, the wired-memory limit is soft: macOS extends it via memory
+    compression and swap, at a throughput cost. The hard cap is therefore
+    closer to total RAM minus what the OS itself needs. On CUDA the VRAM
+    wall is hard (no swap), so hard == comfort and there is no slack to
+    surface. Same for CPU-only inference.
+    """
+    if profile.metal_max_working_set_bytes is None:
+        # Non-Apple: there is no soft/hard distinction worth reporting.
+        return usable_memory_bytes(profile, config)
+    return max(0, profile.total_memory_bytes - config.hard_ceiling_reserve_bytes)
 
 
 def _need_at(spec: ModelSpec, ctx: int, kv_quant: str, config: EstimatorConfig) -> int:
@@ -67,27 +85,36 @@ def _fits(profile: SystemProfile, spec: ModelSpec, ctx: int, kv_quant: str, conf
     return _need_at(spec, ctx, kv_quant, config) <= usable_memory_bytes(profile, config)
 
 
-def max_ctx_that_fits(
-    profile: SystemProfile, spec: ModelSpec, kv_quant: str, config: EstimatorConfig
+def _max_ctx_under_budget(
+    spec: ModelSpec, kv_quant: str, config: EstimatorConfig, budget_bytes: int
 ) -> int:
-    """Largest context (<= native_ctx) whose weights + KV + overhead fit.
-
-    Memory need is monotonic increasing in ctx, so we binary-search the ceiling.
-    Returns 0 if the weights alone don't fit.
-    """
+    """Binary search for the largest ctx whose ``_need_at`` <= ``budget_bytes``.
+    Internal helper — the public surface is ``max_ctx_that_fits``."""
     hi = spec.native_ctx
-    if not _fits(profile, spec, 0, kv_quant, config):
+    if _need_at(spec, 0, kv_quant, config) > budget_bytes:
         return 0
-    if _fits(profile, spec, hi, kv_quant, config):
+    if _need_at(spec, hi, kv_quant, config) <= budget_bytes:
         return hi
     lo = 0
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if _fits(profile, spec, mid, kv_quant, config):
+        if _need_at(spec, mid, kv_quant, config) <= budget_bytes:
             lo = mid
         else:
             hi = mid - 1
     return lo
+
+
+def max_ctx_that_fits(
+    profile: SystemProfile, spec: ModelSpec, kv_quant: str, config: EstimatorConfig
+) -> int:
+    """Largest context (<= native_ctx) whose weights + KV + overhead fit under
+    the COMFORT ceiling.
+
+    Memory need is monotonic increasing in ctx, so we binary-search the ceiling.
+    Returns 0 if the weights alone don't fit.
+    """
+    return _max_ctx_under_budget(spec, kv_quant, config, usable_memory_bytes(profile, config))
 
 
 def estimate_fit(
@@ -123,6 +150,18 @@ def estimate_fit(
     )
     storage_ok = profile.storage_free_bytes >= spec.total_weight_bytes
 
+    # Hard ceiling: the largest context that will load AT ALL on this machine
+    # (e.g. spilling past Apple's wired-memory limit into compression/swap with a
+    # throughput cost). On non-Apple platforms there's no soft/hard distinction
+    # to report — leave hard_max as None to signal that.
+    hard_budget = hard_usable_memory_bytes(profile, config)
+    comfort_budget = breakdown.usable_bytes
+    hard_max: Optional[int]
+    if hard_budget > comfort_budget:
+        hard_max = _max_ctx_under_budget(spec, kv_quant, config, hard_budget)
+    else:
+        hard_max = None
+
     return FitResult(
         max_ctx_that_fits=max_ctx,
         fits_at_native_ctx=fits_native,
@@ -130,6 +169,7 @@ def estimate_fit(
         storage_ok=storage_ok,
         kv_quant_suggestion=suggestion,
         notes=notes,
+        hard_max_ctx_that_fits=hard_max,
     )
 
 

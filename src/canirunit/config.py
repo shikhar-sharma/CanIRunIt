@@ -31,6 +31,11 @@ class EstimatorConfig:
     # Deliberate slack left free so the machine stays responsive. Distinct from
     # in-use memory, which is already excluded by available_memory_bytes.
     safety_headroom_bytes: int = 1024 ** 3
+    # Reserve for the "loads at all" ceiling on Apple, where the wired memory
+    # limit is soft (macOS extends it via compression/swap with a throughput
+    # cost). Models the soft cap as roughly all of RAM minus what the OS
+    # itself needs to stay alive. Approximate — on-device behaviour varies.
+    hard_ceiling_reserve_bytes: int = 3 * 1024 ** 3 // 2  # 1.5 GiB
 
     # Order in which to try lower KV quant when native context doesn't fit at f16.
     kv_quant_order: tuple = ("f16", "q8", "q4")

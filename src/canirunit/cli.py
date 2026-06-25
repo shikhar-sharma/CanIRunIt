@@ -83,6 +83,14 @@ def format_report(
     L.append("FIT")
     L.append(f"  Fits at native context ({spec.native_ctx}):   {'yes' if fit.fits_at_native_ctx else 'no'}")
     L.append(f"  Max context that fits:           {fit.max_ctx_that_fits} tokens")
+    # Two-ceiling model: on Apple the wired-memory cap is soft; macOS extends
+    # it via compression/swap. Surface the hard "loads at all" ceiling when
+    # it's actually higher than the comfort one.
+    if fit.hard_max_ctx_that_fits is not None and fit.hard_max_ctx_that_fits > fit.max_ctx_that_fits:
+        L.append(
+            f"  Loads (with slowdown past wired limit) to: "
+            f"{fit.hard_max_ctx_that_fits} tokens"
+        )
     L.append(
         f"  Storage for weights:             {'ok' if fit.storage_ok else 'INSUFFICIENT'}  "
         f"({_gb(spec.total_weight_bytes):.1f} GB needed, {_gb(profile.storage_free_bytes):.1f} GB free)"
