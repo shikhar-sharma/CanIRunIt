@@ -28,9 +28,24 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .config import EstimatorConfig
-from .gguf import parse_gguf
+# FileReader lives in gguf.py; re-exported here so existing imports
+# (`from canirunit.benchmark import FileReader`) keep working.
+from .gguf import FileReader, parse_gguf
 from .hub import build_model_spec
 from .types import Calibration, ModelSpec, SystemProfile
+
+__all__ = [
+    "BenchResult",
+    "BenchModel",
+    "DEFAULT_BENCH_MODEL",
+    "FileReader",
+    "calibrate",
+    "calibration_from_bench",
+    "find_runtime",
+    "parse_llama_bench_json",
+    "parse_llama_bench_text",
+    "parse_ollama_verbose",
+]
 
 # llama-bench defaults: prompt-processing over 512 tokens, generation of 128.
 # The average context during a tg128 run is ~half the generated length.
@@ -180,18 +195,6 @@ def find_runtime(which: Callable[[str], Optional[str]] = shutil.which) -> Option
 # --------------------------------------------------------------------------- #
 # Orchestration (network + subprocess; runs on a machine with a runtime)
 # --------------------------------------------------------------------------- #
-class FileReader:
-    """ByteReader over a local file — for parsing an already-downloaded GGUF."""
-
-    def __init__(self, path: str):
-        self.path = path
-
-    def read_range(self, start: int, length: int) -> bytes:
-        with open(self.path, "rb") as f:
-            f.seek(start)
-            return f.read(length)
-
-
 def _run(args: list) -> Optional[str]:
     try:
         out = subprocess.run(args, capture_output=True, text=True, timeout=600)

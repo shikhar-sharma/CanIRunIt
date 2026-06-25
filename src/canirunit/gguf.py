@@ -62,6 +62,22 @@ class BytesReader:
         return self._data[start : start + length]
 
 
+class FileReader:
+    """ByteReader over a local file — for parsing an already-downloaded GGUF.
+
+    Lives here (not in benchmark.py) so source modules can use it without
+    creating a benchmark <- source_* dependency.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def read_range(self, start: int, length: int) -> bytes:
+        with open(self.path, "rb") as f:
+            f.seek(start)
+            return f.read(length)
+
+
 @dataclass
 class TensorInfo:
     name: str
@@ -157,7 +173,7 @@ def _read_value(cur: _Cursor, vtype: int, *, keep: bool):
 
 # Metadata keys we actually consume. Anything else is skipped without keeping.
 def _wanted(key: str) -> bool:
-    if key in ("general.architecture", "general.parameter_count"):
+    if key in ("general.architecture", "general.parameter_count", "general.file_type"):
         return True
     tail = key.split(".", 1)[-1]
     return tail in (
