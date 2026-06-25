@@ -136,6 +136,27 @@ def estimate_fit(
 # --------------------------------------------------------------------------- #
 # Speed — decode (bandwidth-bound) and prefill/TTFT (compute-bound)
 # --------------------------------------------------------------------------- #
+def _calibration_applies(calibration: Optional[Calibration], spec: ModelSpec) -> bool:
+    """A calibration applies if its runtime tag matches the spec's runtime.
+
+    GGUF and Ollama share the llama.cpp physics and tooling, so calibrations
+    cross-apply between them. MLX is its own world — an MLX-measured constant
+    on a GGUF target (or vice versa) would silently mislead, so we refuse.
+    """
+    if calibration is None:
+        return False
+    if calibration.runtime == spec.runtime:
+        return True
+    return {calibration.runtime, spec.runtime} == {"gguf", "ollama"}
+
+
+def _pick_calibration(
+    calibration: Optional[Calibration], spec: ModelSpec
+) -> Optional[Calibration]:
+    """Return ``calibration`` iff it applies to ``spec``, else None."""
+    return calibration if _calibration_applies(calibration, spec) else None
+
+
 def effective_bytes_per_sec(
     profile: SystemProfile, config: EstimatorConfig, calibration: Optional[Calibration]
 ) -> float:
@@ -156,8 +177,13 @@ def decode_tok_s(
     calibration: Optional[Calibration] = None,
 ) -> float:
     """Decode is memory-bandwidth-bound. KV sits in the denominator, so speed
-    decays as context fills. Uses active_weight_bytes (MoE-correct)."""
-    eff = effective_bytes_per_sec(profile, config, calibration)
+    decays as context fills. Uses active_weight_bytes (MoE-correct).
+
+    A calibration is only applied if its runtime matches ``spec.runtime``
+    (gguf/ollama are interchangeable). Cross-runtime calibrations are
+    silently dropped here; ``estimate_speed`` surfaces the fact in a note.
+    """
+    eff = effective_bytes_per_sec(profile, config, _pick_calibration(calibration, spec))
     denom = spec.active_weight_bytes + kv_cache_bytes(spec, ctx, kv_quant, config)
     return eff / denom if denom > 0 else 0.0
 
@@ -169,10 +195,14 @@ def prefill_tok_s(
     calibration: Optional[Calibration] = None,
 ) -> float:
     """Prefill is compute-bound: ~ effective_FLOPS / (2 * active_params).
-    Lower confidence than decode; anchored on measured FLOP/s when calibrated."""
+    Lower confidence than decode; anchored on measured FLOP/s when calibrated.
+
+    Same calibration runtime-guard as ``decode_tok_s``.
+    """
     params = max(1, spec.decode_active_params)
-    if calibration is not None and calibration.prefill_flops_per_sec:
-        return calibration.prefill_flops_per_sec / (2 * params)
+    cal = _pick_calibration(calibration, spec)
+    if cal is not None and cal.prefill_flops_per_sec:
+        return cal.prefill_flops_per_sec / (2 * params)
     flops = (profile.peak_flops or config.default_peak_flops) * config.compute_efficiency
     return flops / (2 * params)
 
@@ -192,7 +222,8 @@ def estimate_speed(
     ctx_points: Optional[Sequence[int]] = None,
 ) -> SpeedResult:
     points_ctx = list(ctx_points) if ctx_points is not None else _default_ctx_points(spec.native_ctx)
-    pf = prefill_tok_s(profile, spec, config, calibration)
+    effective_cal = _pick_calibration(calibration, spec)
+    pf = prefill_tok_s(profile, spec, config, calibration)  # guard re-applied inside
 
     points = [
         SpeedPoint(
@@ -204,7 +235,13 @@ def estimate_speed(
     ]
 
     notes: list[str] = []
-    if calibration is None:
+    if calibration is not None and effective_cal is None:
+        notes.append(
+            f"Calibration was measured for runtime {calibration.runtime!r} but "
+            f"this spec's runtime is {spec.runtime!r}; ignoring the calibration "
+            "and falling back to the static estimate."
+        )
+    if effective_cal is None:
         notes.append("Static estimate; run an on-machine calibration for measured numbers.")
     notes.append("Prefill/TTFT is a rougher estimate than decode.")
     if profile.accelerator == "apple_metal":
@@ -212,7 +249,7 @@ def estimate_speed(
 
     return SpeedResult(
         points=points,
-        confidence="measured" if calibration is not None else "estimated",
+        confidence="measured" if effective_cal is not None else "estimated",
         notes=notes,
     )
 

@@ -32,18 +32,21 @@ from .config import EstimatorConfig
 # (`from canirunit.benchmark import FileReader`) keep working.
 from .gguf import FileReader, parse_gguf
 from .hub import build_model_spec
-from .types import Calibration, ModelSpec, SystemProfile
+from .types import Calibration, ModelSpec, Runtime, SystemProfile
 
 __all__ = [
     "BenchResult",
     "BenchModel",
     "DEFAULT_BENCH_MODEL",
+    "DEFAULT_MLX_BENCH_REPO",
     "FileReader",
     "calibrate",
     "calibration_from_bench",
     "find_runtime",
+    "find_runtime_for",
     "parse_llama_bench_json",
     "parse_llama_bench_text",
+    "parse_mlx_lm",
     "parse_ollama_verbose",
 ]
 
@@ -137,6 +140,35 @@ def parse_ollama_verbose(out: str) -> BenchResult:
     return BenchResult(pp_tok_s=pp, tg_tok_s=tg, raw=out)
 
 
+# Tolerant: mlx_lm's exact wording varies by version. Match the rate that
+# directly precedes "tokens-per-sec" / "tok/s" / "tps" — not the prompt-length
+# count earlier in the line. The "prompt"/"generation" anchor decides which
+# bucket the rate lands in.
+_MLX_RATE_RE = re.compile(r"([\d.]+)\s*(?:tokens-per-sec|tok/s|tps)\b", re.IGNORECASE)
+
+
+def parse_mlx_lm(out: str) -> BenchResult:
+    """Parse the throughput summary printed by ``python -m mlx_lm generate``.
+
+    Lines look like (exact wording is version-dependent):
+        Prompt: 512 tokens, 1234.5 tokens-per-sec
+        Generation: 128 tokens, 88.7 tokens-per-sec
+    Older builds may print ``tok/s`` instead of ``tokens-per-sec``.
+    """
+    pp = tg = None
+    for line in out.splitlines():
+        m = _MLX_RATE_RE.search(line)
+        if not m:
+            continue
+        value = float(m.group(1))
+        low = line.lower()
+        if "prompt" in low:
+            pp = value
+        elif "generation" in low or "decode" in low:
+            tg = value
+    return BenchResult(pp_tok_s=pp, tg_tok_s=tg, raw=out)
+
+
 # --------------------------------------------------------------------------- #
 # Back-out (pure): BenchResult + bench model -> Calibration
 # --------------------------------------------------------------------------- #
@@ -147,11 +179,17 @@ def calibration_from_bench(
     source: str,
     gen_ctx: int = _DEFAULT_GEN_CTX,
     config: Optional[EstimatorConfig] = None,
+    *,
+    runtime: Runtime = "gguf",
 ) -> Calibration:
     """Invert the estimator's forward model to recover its constants.
 
     decode:  effective_bytes_per_sec = tg_tok_s * (active_weight_bytes + kv@gen_ctx)
     prefill: prefill_flops_per_sec   = pp_tok_s * 2 * active_params
+
+    ``runtime`` tags which runtime family the resulting constants apply to.
+    The estimator's calibration guard uses this to refuse cross-application
+    (e.g. an MLX-measured constant on a GGUF target).
     """
     from .estimator import kv_cache_bytes  # local import avoids a cycle at import time
 
@@ -174,6 +212,7 @@ def calibration_from_bench(
         measured_on_chip=chip_id,
         source=source,
         prefill_flops_per_sec=pf_flops,
+        runtime=runtime,
     )
 
 
@@ -185,10 +224,54 @@ _RUNTIME_BINARIES = [("llama-bench", "llama-bench"), ("ollama", "ollama")]
 
 def find_runtime(which: Callable[[str], Optional[str]] = shutil.which) -> Optional[str]:
     """Preference order is signal quality: llama-bench (purpose-built, machine
-    readable) before ollama. Returns None if nothing usable is installed."""
+    readable) before ollama. Returns None if nothing usable is installed.
+
+    Kept for backward compatibility; the runtime-aware path is
+    ``find_runtime_for``.
+    """
     for name, binary in _RUNTIME_BINARIES:
         if which(binary):
             return name
+    return None
+
+
+def _mlx_available() -> bool:
+    """True iff this machine can run mlx_lm: Apple Silicon + ``mlx_lm`` importable.
+
+    Never import ``mlx_lm`` at module top — it's Apple-only and we don't want
+    test runs on Linux/Intel Mac to fail at import time.
+    """
+    import platform
+
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        return False
+    try:
+        import importlib
+
+        importlib.import_module("mlx_lm")
+    except ImportError:
+        return False
+    return True
+
+
+def find_runtime_for(
+    target_runtime: Runtime,
+    which: Callable[[str], Optional[str]] = shutil.which,
+    mlx_available: Callable[[], bool] = _mlx_available,
+) -> Optional[str]:
+    """Pick the best installed measurement tool for a target runtime.
+
+    Returns the tool name (``"llama-bench" | "ollama" | "mlx_lm"``) or None.
+    ``which`` and ``mlx_available`` are injectable so tests don't depend on
+    the host's installed binaries.
+    """
+    if target_runtime in ("gguf", "ollama"):
+        for name, binary in _RUNTIME_BINARIES:
+            if which(binary):
+                return name
+        return None
+    if target_runtime == "mlx":
+        return "mlx_lm" if mlx_available() else None
     return None
 
 
@@ -219,19 +302,48 @@ def _local_bench_spec(bench: BenchModel, path: str) -> ModelSpec:
     return build_model_spec(bench.repo_id, bench.quant, info, os.path.getsize(path))
 
 
-def calibrate(
+# Small (~400 MB), already an MLX-community 4-bit quant. Verified on-device
+# step in §12 confirms the repo + the mlx_lm CLI output format.
+DEFAULT_MLX_BENCH_REPO = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
+
+# Default prompt for mlx_lm — long enough to make pp meaningful, short enough
+# to keep the calibration fast. The exact tokens don't matter for throughput.
+_DEFAULT_MLX_PROMPT = "The quick brown fox " * 80
+
+
+def _mlx_snapshot_download(repo_id: str) -> str:
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(repo_id=repo_id)
+
+
+def _mlx_bench_spec_from_local(model_ref: str, snapshot_path: str) -> ModelSpec:
+    """Build a ModelSpec for the calibration target from a local MLX snapshot."""
+    import os
+
+    from .source_mlx import build_mlx_spec
+
+    with open(os.path.join(snapshot_path, "config.json"), "r", encoding="utf-8") as f:
+        config = json.load(f)
+    weight_bytes = sum(
+        os.path.getsize(os.path.join(snapshot_path, name))
+        for name in os.listdir(snapshot_path)
+        if name.lower().endswith(".safetensors")
+    )
+    return build_mlx_spec(model_ref, config, weight_bytes)
+
+
+def _calibrate_gguf(
     profile: SystemProfile,
-    runner: Callable[[list], Optional[str]] = _run,
-    bench: BenchModel = DEFAULT_BENCH_MODEL,
-    downloader: Callable[[str, str], str] = _download,
-    config: Optional[EstimatorConfig] = None,
+    runner: Callable[[list], Optional[str]],
+    bench: BenchModel,
+    downloader: Callable[[str, str], str],
+    config: Optional[EstimatorConfig],
 ) -> Optional[Calibration]:
-    """Run a calibration against the best available runtime. Returns None when no
-    runtime is installed or the run fails — the caller then falls back to the
-    static estimate. Currently wires the llama-bench path; the ollama parser is
-    ready but its orchestration (model naming, spec lookup) is a follow-up."""
-    runtime = find_runtime()
-    if runtime != "llama-bench":
+    runtime_tool = find_runtime_for("gguf", which=shutil.which)
+    if runtime_tool != "llama-bench":
+        # Ollama-as-calibration-backend is a follow-up; today only llama-bench
+        # is wired up. The parser is ready (`parse_ollama_verbose`).
         return None
 
     path = downloader(bench.repo_id, bench.filename)
@@ -243,5 +355,77 @@ def calibrate(
     if not result.tg_tok_s:
         return None
     return calibration_from_bench(
-        result, bench_spec, profile.chip_id, runtime, config=config
+        result, bench_spec, profile.chip_id, runtime_tool, config=config, runtime="gguf"
+    )
+
+
+def _calibrate_mlx(
+    profile: SystemProfile,
+    runner: Callable[[list], Optional[str]],
+    mlx_repo: str,
+    snapshot_downloader: Callable[[str], str],
+    mlx_available: Callable[[], bool],
+    config: Optional[EstimatorConfig],
+) -> Optional[Calibration]:
+    if not mlx_available():
+        return None
+
+    snapshot_path = snapshot_downloader(mlx_repo)
+    bench_spec = _mlx_bench_spec_from_local(mlx_repo, snapshot_path)
+    out = runner([
+        "python", "-m", "mlx_lm", "generate",
+        "--model", snapshot_path,
+        "--prompt", _DEFAULT_MLX_PROMPT,
+        "--max-tokens", "128",
+    ])
+    if out is None:
+        return None
+    result = parse_mlx_lm(out)
+    if not result.tg_tok_s:
+        return None
+    return calibration_from_bench(
+        result, bench_spec, profile.chip_id, "mlx_lm", config=config, runtime="mlx"
+    )
+
+
+def calibrate(
+    profile: SystemProfile,
+    runner: Callable[[list], Optional[str]] = _run,
+    bench: BenchModel = DEFAULT_BENCH_MODEL,
+    downloader: Callable[[str, str], str] = _download,
+    config: Optional[EstimatorConfig] = None,
+    *,
+    target_runtime: Runtime = "gguf",
+    mlx_repo: str = DEFAULT_MLX_BENCH_REPO,
+    mlx_snapshot_downloader: Callable[[str], str] = _mlx_snapshot_download,
+    mlx_available: Callable[[], bool] = _mlx_available,
+) -> Optional[Calibration]:
+    """Run a calibration against the best available runtime.
+
+    Returns None when no runtime is installed or the run fails — the caller
+    then falls back to the static estimate. ``target_runtime`` selects which
+    backend to use:
+      * ``"gguf"``/``"ollama"``: llama-bench, with a small GGUF download.
+      * ``"mlx"``: ``python -m mlx_lm generate``, with a small MLX snapshot.
+
+    The resulting Calibration is tagged with the runtime family it applies
+    to; the estimator refuses to cross-apply (see ``_calibration_applies``).
+    """
+    if target_runtime == "mlx":
+        return _calibrate_mlx(
+            profile,
+            runner=runner,
+            mlx_repo=mlx_repo,
+            snapshot_downloader=mlx_snapshot_downloader,
+            mlx_available=mlx_available,
+            config=config,
+        )
+    # gguf and ollama share the llama.cpp physics and tooling; treat both as
+    # gguf for calibration. (Ollama's own --verbose path is a follow-up.)
+    return _calibrate_gguf(
+        profile,
+        runner=runner,
+        bench=bench,
+        downloader=downloader,
+        config=config,
     )
