@@ -110,6 +110,23 @@ pip install -e ".[dev]"
 pytest
 ```
 
+### Maintainer: regenerating the alias table
+
+`canirunit compare` resolves a logical id (e.g. `llama-3.1-8b-instruct`) to
+per-runtime sources via `src/canirunit/data/aliases.json`. To regenerate from
+Hugging Face listings:
+
+```bash
+python scripts/build_aliases.py                                   # dry skeleton
+python scripts/build_aliases.py --live                            # crawl HF, print JSON
+python scripts/build_aliases.py --live --out data/aliases.json    # write the publication mirror
+```
+
+The script never auto-commits. Review the diff, fix any `family: "TODO"`
+and any wrong Ollama tags, then commit. `data/aliases.json` is the published
+artifact `canirunit refresh` pulls; keep `src/canirunit/data/aliases.json`
+(shipped) in sync with it at release time.
+
 ## License
 
 MIT — see `LICENSE`.
