@@ -13,8 +13,10 @@ subcommand catches the ImportError and prints a clean install hint, so
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Callable, Optional
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +25,7 @@ from pydantic import BaseModel
 import requests
 
 from . import aliases
+from .benchmark import calibrate as _calibrate
 from .cli import _resolve_model_arg
 from .compare import compare as _compare
 from .config import EstimatorConfig
@@ -38,7 +41,7 @@ from .serialize import (
     system_to_dict,
 )
 from .sources import get_source
-from .types import ModelSpec, Runtime, SystemProfile
+from .types import Calibration, ModelSpec, Runtime, SystemProfile
 
 
 # --------------------------------------------------------------------------- #
@@ -76,6 +79,40 @@ def get_compare_fn():
     return _compare
 
 
+# Server-side calibration cache — populated by completed calibrate jobs.
+# Keyed by runtime; consumed by /api/check so the client never has to round-
+# trip a Calibration object. Process-local; wiped on server restart (the spec
+# explicitly rules out cross-invocation persistence).
+_last_calibration_by_runtime: dict[Runtime, Calibration] = {}
+
+
+def get_calibration_cache() -> dict[Runtime, Calibration]:
+    return _last_calibration_by_runtime
+
+
+def get_calibrate_fn():
+    return _calibrate
+
+
+# Job registry. Same DI treatment as the cache so tests get a fresh dict per
+# app, and there's no cross-test bleed via module-level state.
+_jobs: dict[str, dict] = {}
+
+
+def get_jobs() -> dict[str, dict]:
+    return _jobs
+
+
+def _default_executor(fn: Callable, *args) -> None:
+    """Spawn ``fn(*args)`` in a daemon thread. The daemon flag matters — we
+    don't want a hung calibration to keep uvicorn from shutting down."""
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+def get_job_executor():
+    return _default_executor
+
+
 # --------------------------------------------------------------------------- #
 # Request bodies
 # --------------------------------------------------------------------------- #
@@ -89,6 +126,10 @@ class CheckBody(BaseModel):
 
 class CompareBody(BaseModel):
     logical_id: str
+
+
+class CalibrateBody(BaseModel):
+    runtime: Runtime
 
 
 # --------------------------------------------------------------------------- #
@@ -141,8 +182,11 @@ def _register_api(app: FastAPI) -> None:
         config: EstimatorConfig = Depends(get_config),
         source_for=Depends(get_source_registry),
         resolver=Depends(get_alias_resolver),
+        cal_cache: dict = Depends(get_calibration_cache),
     ):
-        return _do_check(body, profile, config, source_for, resolver, calibration=None)
+        # Lookup happens on the spec's runtime AFTER fetch, so it lives in
+        # _do_check.
+        return _do_check(body, profile, config, source_for, resolver, cal_cache=cal_cache)
 
     @app.post("/api/compare")
     def api_compare(
@@ -162,6 +206,101 @@ def _register_api(app: FastAPI) -> None:
             raise HTTPException(status_code=404, detail=str(e))
         return {"rows": [comparison_to_dict(r) for r in rows]}
 
+    @app.post("/api/calibrate")
+    def api_calibrate(
+        body: CalibrateBody,
+        profile: SystemProfile = Depends(get_profile),
+        config: EstimatorConfig = Depends(get_config),
+        cal_cache: dict = Depends(get_calibration_cache),
+        calibrate_fn=Depends(get_calibrate_fn),
+        jobs: dict = Depends(get_jobs),
+        executor: Callable = Depends(get_job_executor),
+    ):
+        job_id = uuid4().hex
+        jobs[job_id] = {
+            "job_id": job_id,
+            "runtime": body.runtime,
+            "status": "pending",
+            "progress": None,
+            "result": None,
+            "error": None,
+        }
+        executor(
+            _run_calibration_job,
+            jobs, job_id, body.runtime, profile, config, calibrate_fn, cal_cache,
+        )
+        return {"job_id": job_id, "status": "pending"}
+
+    @app.get("/api/calibrate/{job_id}")
+    def api_calibrate_poll(job_id: str, jobs: dict = Depends(get_jobs)):
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"job {job_id!r} not found")
+        return job
+
+
+# --------------------------------------------------------------------------- #
+# Calibration job runner (runs off the request thread)
+# --------------------------------------------------------------------------- #
+def _run_calibration_job(
+    jobs: dict,
+    job_id: str,
+    runtime: Runtime,
+    profile: SystemProfile,
+    config: EstimatorConfig,
+    calibrate_fn: Callable[..., Optional[Calibration]],
+    cal_cache: dict,
+) -> None:
+    """Runs the (blocking) calibration and updates the job record.
+
+    ``progress`` is a coarse string ('running benchmark' -> 'done') rather
+    than a percentage. The spec explicitly allows this in v2 — threading a
+    fine-grained callback into ``benchmark.calibrate`` would require
+    invasive changes for little UI payoff.
+    """
+    job = jobs.get(job_id)
+    if job is None:
+        return
+    job["status"] = "running"
+    job["progress"] = "downloading bench model / running benchmark"
+
+    try:
+        cal = calibrate_fn(profile, target_runtime=runtime, config=config)
+    except Exception as e:  # noqa: BLE001 — surface any failure as a job error
+        job["status"] = "error"
+        job["progress"] = None
+        job["error"] = str(e) or e.__class__.__name__
+        return
+
+    if cal is None:
+        job["status"] = "error"
+        job["progress"] = None
+        job["error"] = (
+            f"no calibration tooling found for runtime {runtime!r} "
+            "(install llama-bench for gguf/ollama, or mlx-lm for mlx)"
+        )
+        return
+
+    _install_calibration(cal_cache, cal)
+    job["status"] = "done"
+    job["progress"] = "done"
+    job["result"] = calibration_to_dict(cal)
+
+
+def _install_calibration(cache: dict, cal: Calibration) -> None:
+    """Store the calibration under every runtime tag it would apply to.
+
+    Mirrors the estimator's cross-runtime rule: gguf and ollama share
+    physics so a gguf calibration is also valid for an ollama target. By
+    duplicating the entry at store-time, the /api/check read path stays a
+    single ``cache.get(spec.runtime)`` — no compatibility branch there.
+    """
+    cache[cal.runtime] = cal
+    if cal.runtime == "gguf":
+        cache["ollama"] = cal
+    elif cal.runtime == "ollama":
+        cache["gguf"] = cal
+
 
 # --------------------------------------------------------------------------- #
 # /api/check core (also reused by the calibration cache path in a later commit)
@@ -172,7 +311,7 @@ def _do_check(
     config: EstimatorConfig,
     source_for: Callable[[Runtime], object],
     resolver: Callable[[str], dict],
-    calibration=None,
+    cal_cache: Optional[dict] = None,
 ) -> dict:
     """Runs the same detect -> fetch -> estimate -> serialize sequence as
     ``cli.run_check`` but returns dicts. Does NOT download full models — only
@@ -192,6 +331,14 @@ def _do_check(
         raise HTTPException(status_code=404, detail=str(e))
     except (OSError, requests.exceptions.RequestException) as e:
         raise HTTPException(status_code=502, detail=f"upstream fetch failed: {e}")
+
+    # Server-side calibration cache: apply the most recent calibration for
+    # this spec's runtime, if any. The estimator's runtime guard makes this
+    # safe — a wrong-runtime entry is silently dropped and speed.confidence
+    # stays "estimated".
+    calibration: Optional[Calibration] = None
+    if cal_cache is not None:
+        calibration = cal_cache.get(spec.runtime)
 
     fit = estimate_fit(profile, spec, config)
     speed = estimate_speed(

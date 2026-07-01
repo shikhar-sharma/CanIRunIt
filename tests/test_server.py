@@ -22,8 +22,12 @@ from canirunit.server import (
     create_app,
     get_alias_lister,
     get_alias_resolver,
+    get_calibrate_fn,
+    get_calibration_cache,
     get_compare_fn,
     get_config,
+    get_job_executor,
+    get_jobs,
     get_profile,
     get_source_registry,
 )
@@ -114,6 +118,15 @@ def client():
         "ollama": _FakeSource(spec=_llama_spec(runtime="ollama", quant_label="Q4_K_M"),   runtime="ollama"),
     }
     app.dependency_overrides[get_source_registry] = lambda: _fake_source_factory(default_sources)
+    # Fresh per-app calibration cache and job registry so tests don't bleed
+    # state via the module-level defaults.
+    fresh_cache: dict = {}
+    fresh_jobs: dict = {}
+    app.dependency_overrides[get_calibration_cache] = lambda: fresh_cache
+    app.dependency_overrides[get_jobs] = lambda: fresh_jobs
+    # Synchronous executor: run the calibration inline so the test doesn't
+    # have to poll or sleep. Production spawns a daemon thread.
+    app.dependency_overrides[get_job_executor] = lambda: (lambda fn, *args: fn(*args))
     yield TestClient(app), app, default_sources
 
 
@@ -272,3 +285,126 @@ def test_api_compare_unknown_logical_id_404s(client):
     tc, _, _ = client
     r = tc.post("/api/compare", json={"logical_id": "does-not-exist"})
     assert r.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/calibrate + GET /api/calibrate/{job_id}
+# --------------------------------------------------------------------------- #
+def _fake_gguf_cal():
+    return Calibration(
+        effective_bytes_per_sec=4.76e10,
+        measured_on_chip="Apple M1",
+        source="llama-bench",
+        runtime="gguf",
+        prefill_flops_per_sec=2e12,
+    )
+
+
+def test_api_calibrate_kicks_off_and_completes(client):
+    tc, app, _ = client
+    app.dependency_overrides[get_calibrate_fn] = lambda: (
+        lambda profile, target_runtime, config: _fake_gguf_cal()
+    )
+    r = tc.post("/api/calibrate", json={"runtime": "gguf"})
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+
+    # Sync executor ran the job inline; poll now shows done.
+    poll = tc.get(f"/api/calibrate/{job_id}")
+    assert poll.status_code == 200
+    j = poll.json()
+    assert j["status"] == "done"
+    assert j["error"] is None
+    assert j["result"]["runtime"] == "gguf"
+    assert j["result"]["source"] == "llama-bench"
+
+
+def test_api_calibrate_raises_becomes_error_status(client):
+    tc, app, _ = client
+    def boom(profile, target_runtime, config):
+        raise RuntimeError("mlx_lm subprocess failed")
+    app.dependency_overrides[get_calibrate_fn] = lambda: boom
+    r = tc.post("/api/calibrate", json={"runtime": "mlx"})
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+
+    j = tc.get(f"/api/calibrate/{job_id}").json()
+    assert j["status"] == "error"
+    assert "mlx_lm subprocess failed" in j["error"]
+    assert j["result"] is None
+
+
+def test_api_calibrate_none_result_becomes_error_status(client):
+    """calibrate() returns None when no tooling is installed. The endpoint
+    surfaces that as an error status with a helpful message, not as done."""
+    tc, app, _ = client
+    app.dependency_overrides[get_calibrate_fn] = lambda: (
+        lambda profile, target_runtime, config: None
+    )
+    r = tc.post("/api/calibrate", json={"runtime": "gguf"})
+    j = tc.get(f"/api/calibrate/{r.json()['job_id']}").json()
+    assert j["status"] == "error"
+    assert "no calibration tooling" in j["error"]
+
+
+def test_api_calibrate_poll_unknown_job_404s(client):
+    tc, _, _ = client
+    assert tc.get("/api/calibrate/deadbeef").status_code == 404
+
+
+def test_api_check_after_calibration_shows_measured(client):
+    """After a successful calibrate, subsequent /api/check for the same
+    runtime must report confidence=measured — no client-side round-trip of
+    the calibration required."""
+    tc, app, _ = client
+    app.dependency_overrides[get_calibrate_fn] = lambda: (
+        lambda profile, target_runtime, config: _fake_gguf_cal()
+    )
+    # Before calibration: estimated.
+    before = tc.post("/api/check", json={"model": "llama-3.1-8b-instruct"}).json()
+    assert before["speed"]["confidence"] == "estimated"
+    assert before["calibration_applied"] is None
+
+    tc.post("/api/calibrate", json={"runtime": "gguf"})
+
+    # After calibration: measured, and the applied calibration is reported.
+    after = tc.post("/api/check", json={"model": "llama-3.1-8b-instruct"}).json()
+    assert after["speed"]["confidence"] == "measured"
+    assert after["calibration_applied"] is not None
+    assert after["calibration_applied"]["runtime"] == "gguf"
+
+
+def test_gguf_calibration_also_applies_to_ollama_via_runtime_guard(client):
+    """gguf and ollama share physics — a gguf calibration must apply to an
+    ollama /api/check via the estimator's cross-application rule."""
+    tc, app, _ = client
+    app.dependency_overrides[get_calibrate_fn] = lambda: (
+        lambda profile, target_runtime, config: _fake_gguf_cal()
+    )
+    tc.post("/api/calibrate", json={"runtime": "gguf"})
+    after = tc.post("/api/check", json={"model": "llama-3.1-8b-instruct", "runtime": "ollama"}).json()
+    assert after["speed"]["confidence"] == "measured"
+
+
+def test_mlx_calibration_does_not_apply_to_gguf(client):
+    """Cross-runtime guard: an mlx-tagged calibration on a gguf spec must be
+    dropped. The endpoint should still succeed but confidence stays estimated."""
+    tc, app, _ = client
+    mlx_cal = Calibration(
+        effective_bytes_per_sec=5e10, measured_on_chip="Apple M1",
+        source="mlx_lm", runtime="mlx",
+    )
+    app.dependency_overrides[get_calibrate_fn] = lambda: (
+        lambda profile, target_runtime, config: mlx_cal
+    )
+    tc.post("/api/calibrate", json={"runtime": "mlx"})
+    gguf_check = tc.post("/api/check", json={"model": "llama-3.1-8b-instruct", "runtime": "gguf"}).json()
+    # cross-runtime guard fires: gguf spec, mlx cal -> dropped
+    assert gguf_check["speed"]["confidence"] == "estimated"
+
+
+def test_api_calibrate_route_registered():
+    app = create_app()
+    paths = {r.path for r in app.routes}
+    assert "/api/calibrate" in paths
+    assert "/api/calibrate/{job_id}" in paths
