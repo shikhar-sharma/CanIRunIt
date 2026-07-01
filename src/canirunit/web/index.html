@@ -111,9 +111,22 @@
         read grow with it, so speed drops. Dashed = estimated; solid =
         measured (after calibration).
       </p>
+      <div id="calib-controls" class="calib-controls">
+        <button id="calib-btn" type="button">Calibrate this runtime</button>
+        <span id="calib-status" class="calib-status"></span>
+      </div>
     </section>
 
-    <!-- G. Comparison + calibration — filled in commit 7 -->
+    <!-- G. Comparison across runtimes -->
+    <section id="compare-panel" class="panel" hidden>
+      <div class="section-header">
+        <h2>Compare across runtimes</h2>
+        <button id="compare-refresh-btn" type="button" class="link-btn">Refresh</button>
+      </div>
+      <div id="compare-content" class="empty">
+        Comparison runs against every runtime declared in the alias entry.
+      </div>
+    </section>
   </main>
 
   <footer class="site-footer">

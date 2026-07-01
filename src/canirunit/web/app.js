@@ -47,11 +47,13 @@ async function apiPost(path, payload) {
 }
 
 const API = {
-  system:  ()      => apiGet("/api/system"),
-  models:  ()      => apiGet("/api/models"),
-  check:   (body)  => apiPost("/api/check", body),
-  compare: (body)  => apiPost("/api/compare", body),
-  refresh: ()      => apiPost("/api/refresh", {}),
+  system:    ()          => apiGet("/api/system"),
+  models:    ()          => apiGet("/api/models"),
+  check:     (body)      => apiPost("/api/check", body),
+  compare:   (body)      => apiPost("/api/compare", body),
+  refresh:   ()          => apiPost("/api/refresh", {}),
+  calibrate: (body)      => apiPost("/api/calibrate", body),
+  calibJob:  (id)        => apiGet(`/api/calibrate/${id}`),
 };
 
 // --------------------------------------------------------------------------
@@ -95,11 +97,11 @@ async function renderMachine() {
     const grid = h("div", { class: "machine-grid" },
       metric("Chip", s.chip_id),
       metric("Accelerator", s.accelerator),
-      metric("Memory bandwidth", fmt.bandwidth(s.memory_bandwidth_gbs)),
+      attachHelp(metric("Memory bandwidth", fmt.bandwidth(s.memory_bandwidth_gbs)), "decode-bandwidth"),
       metric("Total memory", fmt.gb(s.total_memory_bytes)),
-      metric(`Usable (${s.usable_basis})`, fmt.gb(s.usable_memory_bytes)),
+      attachHelp(metric(`Usable (${s.usable_basis})`, fmt.gb(s.usable_memory_bytes)), "working-set"),
       s.hard_usable_memory_bytes
-        ? metric("Loads-at-all ceiling", fmt.gb(s.hard_usable_memory_bytes))
+        ? attachHelp(metric("Loads-at-all ceiling", fmt.gb(s.hard_usable_memory_bytes)), "working-set")
         : null,
       metric("Storage free", fmt.gb(s.storage_free_bytes)),
     );
@@ -203,6 +205,14 @@ async function onSelectionChanged() {
   const { model, runtime, quant, kv_quant } = state.selection;
   if (!model) return;
 
+  // Refresh calibration UI to match the newly selected runtime.
+  updateCalibButtonLabel();
+  const calibStatus = document.getElementById("calib-status");
+  if (calibStatus) {
+    calibStatus.textContent = "";
+    calibStatus.classList.remove("ok", "error");
+  }
+
   const fitEl = document.getElementById("fit-content");
   fitEl.classList.remove("empty", "error");
   fitEl.classList.add("pending");
@@ -275,9 +285,9 @@ function renderFit(resp) {
       ),
     ),
     h("div", { class: "fit-metrics" },
-      metric("Max context that fits", `${fmt.int(fit.max_ctx_that_fits)} tokens`),
+      attachHelp(metric("Max context that fits", `${fmt.int(fit.max_ctx_that_fits)} tokens`), "kv-cache"),
       (fit.hard_max_ctx_that_fits && fit.hard_max_ctx_that_fits > fit.max_ctx_that_fits)
-        ? metric("Loads (with slowdown) to", `${fmt.int(fit.hard_max_ctx_that_fits)} tokens`)
+        ? attachHelp(metric("Loads (with slowdown) to", `${fmt.int(fit.hard_max_ctx_that_fits)} tokens`), "working-set")
         : null,
       metric("Storage", fit.storage_ok ? "ok" : "INSUFFICIENT"),
     ),
@@ -285,7 +295,21 @@ function renderFit(resp) {
       ? h("p", { class: "tip" }, `Tip: ${fit.kv_quant_suggestion}`)
       : null,
     ...fit.notes.map((n) => h("p", { class: "note" }, n)),
+    isLogicalId(state.selection.model)
+      ? h("div", { class: "fit-actions" },
+          h("button", {
+            type: "button",
+            class: "compare-btn",
+            onclick: onCompareClick,
+          }, "Compare across runtimes"),
+        )
+      : null,
   );
+}
+
+function isLogicalId(model) {
+  if (!model) return false;
+  return state.models.some((m) => m.id === model);
 }
 
 function barSeg(bytes, scale, cls, title) {
@@ -496,9 +520,251 @@ window.addEventListener("resize", () => {
 });
 
 // --------------------------------------------------------------------------
+// G. Comparison view
+// --------------------------------------------------------------------------
+async function onCompareClick() {
+  const model = state.selection.model;
+  if (!isLogicalId(model)) return;
+  document.getElementById("compare-panel").hidden = false;
+  await runCompare(model);
+  document.getElementById("compare-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function runCompare(logical_id) {
+  const el = document.getElementById("compare-content");
+  el.classList.remove("empty", "error");
+  el.classList.add("pending");
+  el.textContent = "Fanning out across runtimes…";
+  try {
+    const { rows } = await API.compare({ logical_id });
+    el.classList.remove("pending");
+    renderCompare(rows);
+  } catch (err) {
+    el.classList.remove("pending");
+    el.classList.add("error");
+    el.textContent = `Error: ${err.message}`;
+  }
+}
+
+const COMPARE_TARGET_CTX = 8192;
+
+function nearestPoint(points, targetCtx) {
+  if (!points || !points.length) return null;
+  return points.reduce((best, p) =>
+    Math.abs(p.ctx - targetCtx) < Math.abs(best.ctx - targetCtx) ? p : best
+  );
+}
+
+function renderCompare(rows) {
+  const el = document.getElementById("compare-content");
+  const header = h("thead", {},
+    h("tr", {},
+      h("th", {}, "Runtime"),
+      h("th", {}, "Quant"),
+      h("th", {}, "Fits native"),
+      h("th", {}, "Max ctx"),
+      h("th", {}, "Decode @ 8K"),
+      h("th", {}, "TTFT @ 8K"),
+      h("th", {}, "Availability"),
+      h("th", {}),
+    )
+  );
+  const body = h("tbody", {}, ...rows.map(renderCompareRow));
+  const table = h("table", { class: "compare-table" }, header, body);
+  el.replaceChildren(table);
+}
+
+function renderCompareRow(row) {
+  const availClass = row.available ? "avail-ok" : "avail-no";
+  const trClass = row.available ? "" : "row-unavailable";
+  if (row.error) {
+    return h("tr", { class: `row-error ${trClass}` },
+      h("td", { class: "runtime-cell" }, row.runtime),
+      h("td", {}, row.quant_label || "—"),
+      h("td", {}, "—"),
+      h("td", {}, "—"),
+      h("td", {}, "—"),
+      h("td", {}, "—"),
+      h("td", { class: availClass }, row.available_reason),
+      h("td", {}),
+    );
+  }
+  const pt = nearestPoint(row.speed?.points, COMPARE_TARGET_CTX) || { decode_tok_s: null, ttft_s: null };
+  return h("tr", { class: trClass },
+    h("td", { class: "runtime-cell" }, row.runtime),
+    h("td", {}, row.quant_label || row.spec?.quant || "—"),
+    h("td", {}, row.fit?.fits_at_native_ctx ? "yes" : "no"),
+    h("td", {}, row.fit ? fmt.int(row.fit.max_ctx_that_fits) : "—"),
+    h("td", {}, pt.decode_tok_s != null ? `${pt.decode_tok_s.toFixed(1)} tok/s` : "—"),
+    h("td", {}, pt.ttft_s != null ? `${pt.ttft_s.toFixed(1)} s` : "—"),
+    h("td", { class: availClass, title: row.available_reason }, row.available_reason),
+    h("td", { class: "row-actions" },
+      row.available
+        ? h("button", {
+            type: "button", class: "row-calib-btn",
+            onclick: (e) => onRowCalibrate(e.currentTarget, row.runtime),
+          }, "Calibrate")
+        : null,
+    ),
+  );
+}
+
+async function onRowCalibrate(btn, runtime) {
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = "Starting…";
+  try {
+    const outcome = await runCalibrationJob(runtime, (jobStatus) => {
+      btn.textContent = jobStatus === "running" ? "Running…" : "Starting…";
+    });
+    btn.textContent = outcome.ok ? "Done" : "Failed";
+    if (outcome.ok) {
+      // Server-side cache holds the new calibration; refresh both views.
+      await runCompare(state.selection.model);
+      await onSelectionChanged();
+    } else {
+      btn.title = outcome.error || "";
+    }
+  } catch (err) {
+    btn.textContent = "Failed";
+    btn.title = err.message;
+  }
+  setTimeout(() => { btn.disabled = false; btn.textContent = original; btn.title = ""; }, 2500);
+}
+
+// --------------------------------------------------------------------------
+// Calibration flow (used from the decode-curve panel and the compare rows)
+// --------------------------------------------------------------------------
+const CALIB_POLL_MS = 1500;
+
+async function runCalibrationJob(runtime, onProgress) {
+  const { job_id } = await API.calibrate({ runtime });
+  // Poll until done or error.
+  // No async sleep primitive in browsers — Promise + setTimeout.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  while (true) {
+    const job = await API.calibJob(job_id);
+    if (onProgress) onProgress(job.status);
+    if (job.status === "done") return { ok: true, result: job.result };
+    if (job.status === "error") return { ok: false, error: job.error };
+    await sleep(CALIB_POLL_MS);
+  }
+}
+
+function wireCalibrationControls() {
+  const btn = document.getElementById("calib-btn");
+  btn.addEventListener("click", async () => {
+    const runtime = state.selection.runtime;
+    if (!runtime) return;
+    const statusEl = document.getElementById("calib-status");
+    btn.disabled = true;
+    btn.textContent = `Calibrating ${runtime}…`;
+    statusEl.classList.remove("error", "ok");
+    statusEl.textContent = "Downloading bench model, running benchmark…";
+
+    try {
+      const outcome = await runCalibrationJob(runtime);
+      if (outcome.ok) {
+        statusEl.classList.add("ok");
+        statusEl.textContent = "Calibration done — decode curve is now measured.";
+        // Server-side cache holds the new calibration; re-run /api/check.
+        await onSelectionChanged();
+      } else {
+        statusEl.classList.add("error");
+        statusEl.textContent = `Calibration failed: ${outcome.error}`;
+      }
+    } catch (err) {
+      statusEl.classList.add("error");
+      statusEl.textContent = `Calibration failed: ${err.message}`;
+    }
+    btn.textContent = "Calibrate this runtime";
+    // Refresh label to include the current runtime.
+    updateCalibButtonLabel();
+    btn.disabled = false;
+  });
+}
+
+function updateCalibButtonLabel() {
+  const btn = document.getElementById("calib-btn");
+  const runtime = state.selection.runtime;
+  btn.textContent = runtime ? `Calibrate ${runtime}` : "Calibrate this runtime";
+}
+
+// --------------------------------------------------------------------------
+// Glossary / tooltip system
+// --------------------------------------------------------------------------
+let GLOSSARY = {};
+async function loadGlossary() {
+  try {
+    const r = await fetch("/glossary.json");
+    if (r.ok) GLOSSARY = await r.json();
+  } catch (_) { /* graceful: no tooltips, still functional */ }
+}
+
+function helpButton(key) {
+  if (!GLOSSARY[key]) return null;
+  return h("button", {
+    type: "button",
+    class: "help-btn",
+    "aria-label": `About: ${GLOSSARY[key].title}`,
+    onclick: (e) => openHelp(e.currentTarget, key),
+  }, "?");
+}
+
+function openHelp(anchor, key) {
+  // Toggle: if already open for this anchor, close it.
+  const existing = document.querySelector(".help-tip");
+  if (existing) {
+    const same = existing.dataset.anchorKey === key && existing.dataset.anchorId === anchor.dataset.helpAnchor;
+    existing.remove();
+    if (same) return;
+  }
+  const entry = GLOSSARY[key];
+  if (!entry) return;
+  const anchorId = anchor.dataset.helpAnchor || String(Math.random());
+  anchor.dataset.helpAnchor = anchorId;
+
+  const tip = h("div", { class: "help-tip", role: "dialog" },
+    h("div", { class: "help-tip-title" }, entry.title),
+    h("div", { class: "help-tip-body" }, entry.body),
+  );
+  tip.dataset.anchorKey = key;
+  tip.dataset.anchorId = anchorId;
+  document.body.append(tip);
+
+  const rect = anchor.getBoundingClientRect();
+  tip.style.left = `${Math.min(rect.left + window.scrollX, window.innerWidth - 340)}px`;
+  tip.style.top = `${rect.bottom + window.scrollY + 6}px`;
+
+  const onDoc = (ev) => {
+    if (!tip.contains(ev.target) && ev.target !== anchor) {
+      tip.remove();
+      document.removeEventListener("click", onDoc, true);
+    }
+  };
+  setTimeout(() => document.addEventListener("click", onDoc, true), 0);
+}
+
+// Attach a glossary help affordance to an existing metric() element.
+function attachHelp(metricEl, glossaryKey) {
+  const help = helpButton(glossaryKey);
+  if (help) metricEl.querySelector(".lbl")?.append(" ", help);
+  return metricEl;
+}
+
+function wireCompareRefresh() {
+  document.getElementById("compare-refresh-btn").addEventListener("click", () => {
+    if (isLogicalId(state.selection.model)) runCompare(state.selection.model);
+  });
+}
+
+// --------------------------------------------------------------------------
 // Boot
 // --------------------------------------------------------------------------
 wirePicker();
 wireQuantControls();
+wireCalibrationControls();
+wireCompareRefresh();
+loadGlossary();
 renderMachine();
 loadModels();

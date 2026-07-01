@@ -351,6 +351,117 @@ p.note {
   font-size: 10px;
 }
 
+/* --- Compare button in fit summary --- */
+.fit-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-start;
+}
+.compare-btn {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: var(--text);
+}
+.compare-btn:hover:not(:disabled) { background: var(--accent); }
+
+/* --- G. Comparison view --- */
+.section-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.section-header h2 { margin: 0; }
+
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.compare-table th, .compare-table td {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+.compare-table th {
+  color: var(--text-dim);
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.runtime-cell {
+  font-weight: 600;
+}
+.avail-ok { color: var(--ok); }
+.avail-no { color: var(--warn); }
+.row-unavailable { opacity: 0.65; }
+.row-error td { color: var(--bad); }
+.row-actions { text-align: right; }
+.row-calib-btn { padding: 4px 10px; font-size: 12px; }
+
+/* --- Calibration controls --- */
+.calib-controls {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.calib-status {
+  color: var(--text-dim);
+  font-size: 13px;
+  font-style: italic;
+}
+.calib-status.ok    { color: var(--ok); font-style: normal; }
+.calib-status.error { color: var(--bad); font-style: normal; }
+
+/* --- Glossary help affordance --- */
+.help-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px; height: 14px;
+  padding: 0;
+  margin-left: 4px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  line-height: 1;
+}
+.help-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.help-tip {
+  position: absolute;
+  max-width: 320px;
+  z-index: 100;
+  background: #10141c;
+  border: 1px solid var(--accent-dim);
+  border-radius: 8px;
+  padding: 10px 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+  font-size: 13px;
+}
+.help-tip-title {
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 4px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.help-tip-body {
+  color: var(--text);
+}
+
 /* Footer */
 .site-footer {
   margin-top: 20px;

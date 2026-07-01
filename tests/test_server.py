@@ -492,3 +492,18 @@ def test_vendored_uplot_is_served(client):
     css = tc.get("/vendor/uPlot.min.css")
     assert css.status_code == 200
     assert css.headers["content-type"].startswith("text/css")
+
+
+def test_glossary_json_is_served(client):
+    """The glossary must be reachable by the frontend as a static file."""
+    tc, _, _ = client
+    r = tc.get("/glossary.json")
+    assert r.status_code == 200
+    data = r.json()
+    # Every teaching entry required by the spec is present.
+    for key in ("fit-vs-speed", "kv-cache", "decode-bandwidth",
+                "prefill-compute", "working-set", "quantization",
+                "estimated-vs-measured"):
+        assert key in data, f"missing glossary entry {key!r}"
+        assert data[key].get("title")
+        assert data[key].get("body")

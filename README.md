@@ -1,7 +1,8 @@
 # canirunit
 
 Estimate whether a local **GGUF**, **MLX**, or **Ollama** model will fit and
-run well on your machine — before you download gigabytes to find out.
+run well on your machine — before you download gigabytes to find out. CLI or
+local web UI.
 
 It answers two separate questions, because they have different physics and
 different reliability:
@@ -21,6 +22,9 @@ Requires Python 3.10+.
 git clone https://github.com/shikhar-sharma/CanIRunIt.git
 cd CanIRunIt
 pip install -e .
+
+# Optional: the local web UI
+pip install -e ".[ui]"
 ```
 
 ## Usage
@@ -43,6 +47,24 @@ canirunit compare llama-3.1-8b-instruct --calibrate
 canirunit models
 canirunit refresh
 ```
+
+### Web UI
+
+Once `canirunit[ui]` is installed:
+
+```bash
+canirunit serve
+```
+
+Opens a page on `http://127.0.0.1:8765/` (bound to localhost only; no auth, no
+external exposure). The UI is a teaching layer over the CLI: pick a model,
+see whether it fits at native context, watch the KV cache overtake the
+usable-memory ceiling as context grows, compare runtimes side by side, and
+calibrate to trade the estimated decode curve for a measured one.
+
+No bundled desktop app; the floor for non-CLI users is `canirunit serve`
+plus a browser. That's on purpose — a native app bundle is a separate
+future effort.
 
 Example output:
 
