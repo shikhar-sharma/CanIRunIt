@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>canirunit</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <h1>canirunit</h1>
+      <p class="subtitle">Will this model fit? How fast will it run?</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <!-- A. Machine panel -->
+    <section id="machine-panel" class="panel">
+      <h2>Machine</h2>
+      <div id="machine-content" class="pending">Detecting hardware…</div>
+    </section>
+
+    <!-- B. Model picker -->
+    <section id="picker-panel" class="panel">
+      <h2>Model</h2>
+      <div class="picker-controls">
+        <input type="search" id="model-search" placeholder="Search models…" autocomplete="off">
+        <select id="model-select" size="8" aria-label="Model list"></select>
+      </div>
+      <p class="picker-hint">
+        Don't see your model?
+        <button id="refresh-btn" type="button" class="link-btn">Refresh model list</button>
+        to pull the latest.
+      </p>
+      <details id="advanced-picker">
+        <summary>Advanced: use a specific repo id / Ollama tag</summary>
+        <div class="advanced-fields">
+          <input type="text" id="advanced-ref" placeholder="e.g. bartowski/Meta-Llama-3.1-8B-Instruct-GGUF">
+          <select id="advanced-runtime" aria-label="Runtime">
+            <option value="gguf">GGUF</option>
+            <option value="mlx">MLX</option>
+            <option value="ollama">Ollama</option>
+          </select>
+          <button id="advanced-check" type="button">Check</button>
+        </div>
+      </details>
+    </section>
+
+    <!-- C. Fit summary -->
+    <section id="fit-panel" class="panel">
+      <h2>Fit</h2>
+      <div id="fit-content" class="empty">Pick a model to see whether it fits.</div>
+    </section>
+
+    <!-- D. KV-cache curve — filled in commit 6 -->
+    <!-- E. Decode-decay curve — filled in commit 6 -->
+    <!-- F. Quantization controls — filled in commit 6 -->
+    <!-- G. Comparison + calibration — filled in commit 7 -->
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <span>canirunit — local tool. Bound to 127.0.0.1.</span>
+    </div>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

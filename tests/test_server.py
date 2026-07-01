@@ -441,3 +441,43 @@ def test_api_refresh_route_registered():
     app = create_app()
     paths = {r.path for r in app.routes}
     assert "/api/refresh" in paths
+
+
+# --------------------------------------------------------------------------- #
+# Static frontend mount (present once src/canirunit/web/ ships in commit 5)
+# --------------------------------------------------------------------------- #
+def test_static_index_served_at_root(client):
+    tc, _, _ = client
+    r = tc.get("/")
+    assert r.status_code == 200
+    # StaticFiles serves index.html at directory root when html=True.
+    assert r.headers["content-type"].startswith("text/html")
+    body = r.text
+    assert "canirunit" in body
+    assert "id=\"machine-content\"" in body
+    assert "id=\"model-select\"" in body
+    assert "id=\"fit-content\"" in body
+
+
+def test_static_app_js_served(client):
+    tc, _, _ = client
+    r = tc.get("/app.js")
+    assert r.status_code == 200
+    ct = r.headers["content-type"]
+    assert "javascript" in ct or ct.startswith("text/")
+    # A tiny sanity check on content — the API wrapper is present.
+    assert "apiGet" in r.text or "API" in r.text
+
+
+def test_static_styles_served(client):
+    tc, _, _ = client
+    r = tc.get("/styles.css")
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/css")
+
+
+def test_api_routes_still_work_alongside_static_mount(client):
+    """The static mount is at '/' — API routes must still take precedence."""
+    tc, _, _ = client
+    assert tc.get("/api/system").status_code == 200
+    assert tc.get("/api/models").status_code == 200
