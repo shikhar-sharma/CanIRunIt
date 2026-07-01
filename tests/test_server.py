@@ -29,6 +29,7 @@ from canirunit.server import (
     get_job_executor,
     get_jobs,
     get_profile,
+    get_refresh_fn,
     get_source_registry,
 )
 
@@ -408,3 +409,35 @@ def test_api_calibrate_route_registered():
     paths = {r.path for r in app.routes}
     assert "/api/calibrate" in paths
     assert "/api/calibrate/{job_id}" in paths
+
+
+# --------------------------------------------------------------------------- #
+# POST /api/refresh
+# --------------------------------------------------------------------------- #
+def test_api_refresh_success(client):
+    tc, app, _ = client
+    app.dependency_overrides[get_refresh_fn] = lambda: (
+        lambda: {"ok": True, "models": 7, "updated_at": "2026-07-01T00:00:00Z",
+                 "path": "/tmp/overlay.json"}
+    )
+    r = tc.post("/api/refresh")
+    assert r.status_code == 200
+    d = r.json()
+    assert d["models"] == 7
+    assert d["updated_at"] == "2026-07-01T00:00:00Z"
+
+
+def test_api_refresh_failure_returns_502(client):
+    tc, app, _ = client
+    app.dependency_overrides[get_refresh_fn] = lambda: (
+        lambda: {"ok": False, "error": "network error: dns"}
+    )
+    r = tc.post("/api/refresh")
+    assert r.status_code == 502
+    assert "network error" in r.json()["detail"]
+
+
+def test_api_refresh_route_registered():
+    app = create_app()
+    paths = {r.path for r in app.routes}
+    assert "/api/refresh" in paths

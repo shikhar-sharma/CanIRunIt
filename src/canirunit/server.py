@@ -75,6 +75,10 @@ def get_alias_lister() -> Callable[[], list[dict]]:
     return aliases.list_models
 
 
+def get_refresh_fn() -> Callable[[], dict]:
+    return aliases.refresh
+
+
 def get_compare_fn():
     return _compare
 
@@ -237,6 +241,20 @@ def _register_api(app: FastAPI) -> None:
         if job is None:
             raise HTTPException(status_code=404, detail=f"job {job_id!r} not found")
         return job
+
+    @app.post("/api/refresh")
+    def api_refresh(refresh_fn=Depends(get_refresh_fn)):
+        """Pull the canonical alias table into the local overlay. Delegates
+        to ``aliases.refresh`` which handles the network+atomic-write; failures
+        (network/JSON/schema) surface as a 502."""
+        result = refresh_fn()
+        if not result.get("ok"):
+            raise HTTPException(status_code=502, detail=result.get("error", "refresh failed"))
+        return {
+            "models": result["models"],
+            "updated_at": result.get("updated_at"),
+            "path": result.get("path"),
+        }
 
 
 # --------------------------------------------------------------------------- #
