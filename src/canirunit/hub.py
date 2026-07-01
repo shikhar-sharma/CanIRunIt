@@ -10,6 +10,7 @@ header (range-read) supplies architecture params. Card prose is never consulted.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Optional
 
 import requests
@@ -99,6 +100,8 @@ def build_model_spec(
         is_moe=is_moe,
         active_params=active_params,
         kv_is_standard=kv_is_standard(arch),
+        runtime="gguf",
+        quant_label=quant,
     )
 
 
@@ -187,3 +190,19 @@ def fetch_model(
         info = parse_gguf(HttpRangeReader(url), need_tensors=True)
 
     return build_model_spec(repo_id, quant, info, total)
+
+
+# --------------------------------------------------------------------------- #
+# SpecSource adapter (see sources.py for the Protocol)
+# --------------------------------------------------------------------------- #
+class GgufSource:
+    """SpecSource wrapper around `fetch_model`. Exists so the comparison
+    resolver can treat GGUF identically to MLX/Ollama. The math is unchanged."""
+
+    runtime = "gguf"
+
+    def fetch(self, model_ref: str, quant: Optional[str] = None) -> ModelSpec:
+        spec = fetch_model(model_ref, quant or "Q4_K_M")
+        # build_model_spec already sets these, but be defensive against future
+        # callers that hand-build a GGUF spec without them.
+        return replace(spec, runtime="gguf", quant_label=spec.quant_label or spec.quant)

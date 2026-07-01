@@ -39,8 +39,10 @@ _SCALAR_FMT = {
 }
 
 # Architectures whose KV cache is compressed (MLA etc.) and so the standard
-# per-head formula does not apply. We flag rather than mis-estimate.
-_NON_STANDARD_KV_ARCHS = {"deepseek2"}
+# per-head formula does not apply. We flag rather than mis-estimate. Includes
+# both the GGUF-side names (deepseek2/3) and the HF-transformers model_type
+# names (deepseek_v2/v3) so MLX configs hit the same flag.
+_NON_STANDARD_KV_ARCHS = {"deepseek2", "deepseek3", "deepseek_v2", "deepseek_v3"}
 
 
 class ByteReader(Protocol):
@@ -58,6 +60,22 @@ class BytesReader:
 
     def read_range(self, start: int, length: int) -> bytes:
         return self._data[start : start + length]
+
+
+class FileReader:
+    """ByteReader over a local file — for parsing an already-downloaded GGUF.
+
+    Lives here (not in benchmark.py) so source modules can use it without
+    creating a benchmark <- source_* dependency.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def read_range(self, start: int, length: int) -> bytes:
+        with open(self.path, "rb") as f:
+            f.seek(start)
+            return f.read(length)
 
 
 @dataclass
@@ -155,7 +173,7 @@ def _read_value(cur: _Cursor, vtype: int, *, keep: bool):
 
 # Metadata keys we actually consume. Anything else is skipped without keeping.
 def _wanted(key: str) -> bool:
-    if key in ("general.architecture", "general.parameter_count"):
+    if key in ("general.architecture", "general.parameter_count", "general.file_type"):
         return True
     tail = key.split(".", 1)[-1]
     return tail in (

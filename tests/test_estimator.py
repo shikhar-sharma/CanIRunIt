@@ -209,6 +209,58 @@ def test_weights_too_big_gives_zero_ceiling(m1, cfg):
 
 
 # --------------------------------------------------------------------------- #
+# Two-ceiling fit model: hard (loads at all) vs comfort (fully resident)
+# --------------------------------------------------------------------------- #
+def test_hard_ceiling_extends_apple_max_ctx(m1, cfg, llama3_8b_q4):
+    """On Apple the wired limit is soft (macOS extends it via compression/swap),
+    so the 'loads at all' ceiling should exceed the comfort ceiling whenever the
+    model is large enough to be KV-bound. Here llama3_8b_q4 at 4.9 GB on a 12 GB
+    working set: the hard cap uses 16 - 1.5 = 14.5 GiB, giving extra room for KV."""
+    fit = estimate_fit(m1, llama3_8b_q4, cfg)
+    assert fit.hard_max_ctx_that_fits is not None
+    # The hard ceiling must reach at least as far as the comfort one — never less.
+    assert fit.hard_max_ctx_that_fits >= fit.max_ctx_that_fits
+
+
+def test_hard_ceiling_is_none_on_non_apple(cfg, llama3_8b_q4):
+    """CUDA / CPU have no soft/hard distinction worth reporting; field stays None."""
+    cuda_box = SystemProfile(
+        total_memory_bytes=64 * GiB, available_memory_bytes=20 * GiB,
+        memory_bandwidth_gbs=900.0, accelerator="cuda", chip_id="NVIDIA RTX 4090",
+        storage_free_bytes=200 * GiB, metal_max_working_set_bytes=None, peak_flops=82e12,
+    )
+    fit = estimate_fit(cuda_box, llama3_8b_q4, cfg)
+    assert fit.hard_max_ctx_that_fits is None
+
+
+def test_hard_ceiling_rescues_models_that_dont_fit_comfortably(m1, cfg):
+    """A model that exceeds the comfort cap but fits the hard one should show
+    max_ctx_that_fits == 0 while hard_max_ctx_that_fits > 0."""
+    # 13 GB model on a 12 GB working set, 16 GB total: comfort=0, hard>0.
+    spec = ModelSpec(
+        repo_id="x", quant="Q4_K_M",
+        total_weight_bytes=13_000_000_000, active_weight_bytes=13_000_000_000,
+        total_params=20_000_000_000, n_layers=40, n_kv_heads=8,
+        key_length=128, value_length=128, native_ctx=8192, architecture="llama",
+    )
+    fit = estimate_fit(m1, spec, cfg)
+    assert fit.max_ctx_that_fits == 0
+    assert fit.hard_max_ctx_that_fits is not None and fit.hard_max_ctx_that_fits > 0
+
+
+def test_existing_max_ctx_unchanged_by_hard_ceiling(m1, cfg, llama3_8b_q4):
+    """Backward-compat pin: the legacy ``max_ctx_that_fits`` value must not
+    shift because of the two-ceiling addition. Llama 3 8B has native_ctx=8192
+    and fits comfortably on the M1 working set, so the comfort ceiling caps
+    at native — adding the hard ceiling must NOT change that."""
+    fit = estimate_fit(m1, llama3_8b_q4, cfg)
+    assert fit.max_ctx_that_fits == 8192
+    assert fit.fits_at_native_ctx is True
+    # Hard ceiling >= comfort. For a model that fits at native, both equal native.
+    assert fit.hard_max_ctx_that_fits is not None and fit.hard_max_ctx_that_fits >= 8192
+
+
+# --------------------------------------------------------------------------- #
 # MoE — fit uses total, decode uses active
 # --------------------------------------------------------------------------- #
 def test_moe_decode_uses_active_not_total(m1, cfg):

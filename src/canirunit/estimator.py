@@ -40,19 +40,37 @@ def kv_cache_bytes(spec: ModelSpec, ctx: int, kv_quant: str, config: EstimatorCo
 # Memory budget
 # --------------------------------------------------------------------------- #
 def usable_memory_bytes(profile: SystemProfile, config: EstimatorConfig) -> int:
-    """What we can actually spend on weights + KV + compute buffers.
+    """The COMFORT ceiling: what we can spend without spilling past the wired
+    limit / available cap.
 
     On Apple the Metal working set is the authoritative ceiling: when a model
     loads, macOS reclaims cache/inactive memory up to the wired limit, so the
     *instantaneous* free RAM must NOT cap the budget (otherwise the verdict swings
     with whatever apps happen to be open). Elsewhere — CUDA free VRAM, or CPU
     available RAM — the available figure is the real cap.
+
+    See ``hard_usable_memory_bytes`` for the soft "loads at all" ceiling.
     """
     if profile.metal_max_working_set_bytes is not None:
         cap = profile.metal_max_working_set_bytes
     else:
         cap = profile.available_memory_bytes
     return max(0, cap - config.safety_headroom_bytes)
+
+
+def hard_usable_memory_bytes(profile: SystemProfile, config: EstimatorConfig) -> int:
+    """The HARD "loads at all" ceiling, distinct from the comfort ceiling.
+
+    On Apple, the wired-memory limit is soft: macOS extends it via memory
+    compression and swap, at a throughput cost. The hard cap is therefore
+    closer to total RAM minus what the OS itself needs. On CUDA the VRAM
+    wall is hard (no swap), so hard == comfort and there is no slack to
+    surface. Same for CPU-only inference.
+    """
+    if profile.metal_max_working_set_bytes is None:
+        # Non-Apple: there is no soft/hard distinction worth reporting.
+        return usable_memory_bytes(profile, config)
+    return max(0, profile.total_memory_bytes - config.hard_ceiling_reserve_bytes)
 
 
 def _need_at(spec: ModelSpec, ctx: int, kv_quant: str, config: EstimatorConfig) -> int:
@@ -67,27 +85,36 @@ def _fits(profile: SystemProfile, spec: ModelSpec, ctx: int, kv_quant: str, conf
     return _need_at(spec, ctx, kv_quant, config) <= usable_memory_bytes(profile, config)
 
 
-def max_ctx_that_fits(
-    profile: SystemProfile, spec: ModelSpec, kv_quant: str, config: EstimatorConfig
+def _max_ctx_under_budget(
+    spec: ModelSpec, kv_quant: str, config: EstimatorConfig, budget_bytes: int
 ) -> int:
-    """Largest context (<= native_ctx) whose weights + KV + overhead fit.
-
-    Memory need is monotonic increasing in ctx, so we binary-search the ceiling.
-    Returns 0 if the weights alone don't fit.
-    """
+    """Binary search for the largest ctx whose ``_need_at`` <= ``budget_bytes``.
+    Internal helper — the public surface is ``max_ctx_that_fits``."""
     hi = spec.native_ctx
-    if not _fits(profile, spec, 0, kv_quant, config):
+    if _need_at(spec, 0, kv_quant, config) > budget_bytes:
         return 0
-    if _fits(profile, spec, hi, kv_quant, config):
+    if _need_at(spec, hi, kv_quant, config) <= budget_bytes:
         return hi
     lo = 0
     while lo < hi:
         mid = (lo + hi + 1) // 2
-        if _fits(profile, spec, mid, kv_quant, config):
+        if _need_at(spec, mid, kv_quant, config) <= budget_bytes:
             lo = mid
         else:
             hi = mid - 1
     return lo
+
+
+def max_ctx_that_fits(
+    profile: SystemProfile, spec: ModelSpec, kv_quant: str, config: EstimatorConfig
+) -> int:
+    """Largest context (<= native_ctx) whose weights + KV + overhead fit under
+    the COMFORT ceiling.
+
+    Memory need is monotonic increasing in ctx, so we binary-search the ceiling.
+    Returns 0 if the weights alone don't fit.
+    """
+    return _max_ctx_under_budget(spec, kv_quant, config, usable_memory_bytes(profile, config))
 
 
 def estimate_fit(
@@ -123,6 +150,18 @@ def estimate_fit(
     )
     storage_ok = profile.storage_free_bytes >= spec.total_weight_bytes
 
+    # Hard ceiling: the largest context that will load AT ALL on this machine
+    # (e.g. spilling past Apple's wired-memory limit into compression/swap with a
+    # throughput cost). On non-Apple platforms there's no soft/hard distinction
+    # to report — leave hard_max as None to signal that.
+    hard_budget = hard_usable_memory_bytes(profile, config)
+    comfort_budget = breakdown.usable_bytes
+    hard_max: Optional[int]
+    if hard_budget > comfort_budget:
+        hard_max = _max_ctx_under_budget(spec, kv_quant, config, hard_budget)
+    else:
+        hard_max = None
+
     return FitResult(
         max_ctx_that_fits=max_ctx,
         fits_at_native_ctx=fits_native,
@@ -130,12 +169,34 @@ def estimate_fit(
         storage_ok=storage_ok,
         kv_quant_suggestion=suggestion,
         notes=notes,
+        hard_max_ctx_that_fits=hard_max,
     )
 
 
 # --------------------------------------------------------------------------- #
 # Speed — decode (bandwidth-bound) and prefill/TTFT (compute-bound)
 # --------------------------------------------------------------------------- #
+def _calibration_applies(calibration: Optional[Calibration], spec: ModelSpec) -> bool:
+    """A calibration applies if its runtime tag matches the spec's runtime.
+
+    GGUF and Ollama share the llama.cpp physics and tooling, so calibrations
+    cross-apply between them. MLX is its own world — an MLX-measured constant
+    on a GGUF target (or vice versa) would silently mislead, so we refuse.
+    """
+    if calibration is None:
+        return False
+    if calibration.runtime == spec.runtime:
+        return True
+    return {calibration.runtime, spec.runtime} == {"gguf", "ollama"}
+
+
+def _pick_calibration(
+    calibration: Optional[Calibration], spec: ModelSpec
+) -> Optional[Calibration]:
+    """Return ``calibration`` iff it applies to ``spec``, else None."""
+    return calibration if _calibration_applies(calibration, spec) else None
+
+
 def effective_bytes_per_sec(
     profile: SystemProfile, config: EstimatorConfig, calibration: Optional[Calibration]
 ) -> float:
@@ -156,8 +217,13 @@ def decode_tok_s(
     calibration: Optional[Calibration] = None,
 ) -> float:
     """Decode is memory-bandwidth-bound. KV sits in the denominator, so speed
-    decays as context fills. Uses active_weight_bytes (MoE-correct)."""
-    eff = effective_bytes_per_sec(profile, config, calibration)
+    decays as context fills. Uses active_weight_bytes (MoE-correct).
+
+    A calibration is only applied if its runtime matches ``spec.runtime``
+    (gguf/ollama are interchangeable). Cross-runtime calibrations are
+    silently dropped here; ``estimate_speed`` surfaces the fact in a note.
+    """
+    eff = effective_bytes_per_sec(profile, config, _pick_calibration(calibration, spec))
     denom = spec.active_weight_bytes + kv_cache_bytes(spec, ctx, kv_quant, config)
     return eff / denom if denom > 0 else 0.0
 
@@ -169,10 +235,14 @@ def prefill_tok_s(
     calibration: Optional[Calibration] = None,
 ) -> float:
     """Prefill is compute-bound: ~ effective_FLOPS / (2 * active_params).
-    Lower confidence than decode; anchored on measured FLOP/s when calibrated."""
+    Lower confidence than decode; anchored on measured FLOP/s when calibrated.
+
+    Same calibration runtime-guard as ``decode_tok_s``.
+    """
     params = max(1, spec.decode_active_params)
-    if calibration is not None and calibration.prefill_flops_per_sec:
-        return calibration.prefill_flops_per_sec / (2 * params)
+    cal = _pick_calibration(calibration, spec)
+    if cal is not None and cal.prefill_flops_per_sec:
+        return cal.prefill_flops_per_sec / (2 * params)
     flops = (profile.peak_flops or config.default_peak_flops) * config.compute_efficiency
     return flops / (2 * params)
 
@@ -192,7 +262,8 @@ def estimate_speed(
     ctx_points: Optional[Sequence[int]] = None,
 ) -> SpeedResult:
     points_ctx = list(ctx_points) if ctx_points is not None else _default_ctx_points(spec.native_ctx)
-    pf = prefill_tok_s(profile, spec, config, calibration)
+    effective_cal = _pick_calibration(calibration, spec)
+    pf = prefill_tok_s(profile, spec, config, calibration)  # guard re-applied inside
 
     points = [
         SpeedPoint(
@@ -204,7 +275,13 @@ def estimate_speed(
     ]
 
     notes: list[str] = []
-    if calibration is None:
+    if calibration is not None and effective_cal is None:
+        notes.append(
+            f"Calibration was measured for runtime {calibration.runtime!r} but "
+            f"this spec's runtime is {spec.runtime!r}; ignoring the calibration "
+            "and falling back to the static estimate."
+        )
+    if effective_cal is None:
         notes.append("Static estimate; run an on-machine calibration for measured numbers.")
     notes.append("Prefill/TTFT is a rougher estimate than decode.")
     if profile.accelerator == "apple_metal":
@@ -212,7 +289,7 @@ def estimate_speed(
 
     return SpeedResult(
         points=points,
-        confidence="measured" if calibration is not None else "estimated",
+        confidence="measured" if effective_cal is not None else "estimated",
         notes=notes,
     )
 

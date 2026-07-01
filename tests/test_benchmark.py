@@ -5,15 +5,18 @@ from __future__ import annotations
 import pytest
 
 from canirunit import EstimatorConfig, ModelSpec, SystemProfile
+from canirunit import Calibration
 from canirunit.benchmark import (
     BenchResult,
     calibration_from_bench,
     find_runtime,
+    find_runtime_for,
     parse_llama_bench_json,
     parse_llama_bench_text,
+    parse_mlx_lm,
     parse_ollama_verbose,
 )
-from canirunit.estimator import decode_tok_s, prefill_tok_s
+from canirunit.estimator import decode_tok_s, estimate_speed, prefill_tok_s
 
 GiB = 1024 ** 3
 
@@ -148,3 +151,161 @@ def test_find_runtime_falls_back_to_ollama():
 
 def test_find_runtime_none_when_absent():
     assert find_runtime(lambda b: None) is None
+
+
+# --------------------------------------------------------------------------- #
+# mlx_lm parser
+# --------------------------------------------------------------------------- #
+MLX_LM_SAMPLE = """\
+==========
+Prompt: 512 tokens, 1234.567 tokens-per-sec
+Generation: 128 tokens, 88.745 tokens-per-sec
+==========
+"""
+
+# Older mlx_lm versions used the shorter "tok/s" unit.
+MLX_LM_SAMPLE_OLD = """\
+Prompt: 1234.5 tok/s
+Generation: 88.7 tok/s
+"""
+
+
+def test_parse_mlx_lm_modern():
+    r = parse_mlx_lm(MLX_LM_SAMPLE)
+    assert r.pp_tok_s == pytest.approx(1234.567)
+    assert r.tg_tok_s == pytest.approx(88.745)
+
+
+def test_parse_mlx_lm_older_units():
+    r = parse_mlx_lm(MLX_LM_SAMPLE_OLD)
+    assert r.pp_tok_s == 1234.5
+    assert r.tg_tok_s == 88.7
+
+
+def test_parse_mlx_lm_does_not_grab_token_count():
+    """The line says '512 tokens, 1234.5 tokens-per-sec'. Make sure we read
+    1234.5 (the rate) not 512 (the count)."""
+    r = parse_mlx_lm("Prompt: 512 tokens, 1234.5 tokens-per-sec\n")
+    assert r.pp_tok_s == 1234.5
+
+
+# --------------------------------------------------------------------------- #
+# Runtime-aware discovery
+# --------------------------------------------------------------------------- #
+def test_find_runtime_for_gguf_prefers_llama_bench():
+    which = lambda b: "/usr/bin/" + b if b in ("llama-bench", "ollama") else None
+    assert find_runtime_for("gguf", which=which) == "llama-bench"
+
+
+def test_find_runtime_for_ollama_uses_same_chain_as_gguf():
+    which = lambda b: "/usr/bin/ollama" if b == "ollama" else None
+    assert find_runtime_for("ollama", which=which) == "ollama"
+
+
+def test_find_runtime_for_mlx_when_available():
+    assert find_runtime_for("mlx", which=lambda b: None, mlx_available=lambda: True) == "mlx_lm"
+
+
+def test_find_runtime_for_mlx_when_unavailable():
+    assert find_runtime_for("mlx", which=lambda b: None, mlx_available=lambda: False) is None
+
+
+# --------------------------------------------------------------------------- #
+# Per-runtime calibration tagging + round-trip
+# --------------------------------------------------------------------------- #
+def _mlx_qwen_0_5b():
+    """Mirror qwen_0_5b but tagged runtime=mlx for the MLX round-trip."""
+    return ModelSpec(
+        repo_id="mlx-community/Qwen2.5-0.5B-Instruct-4bit", quant="4bit-g64",
+        total_weight_bytes=397_000_000, active_weight_bytes=397_000_000,
+        total_params=494_000_000,
+        n_layers=24, n_kv_heads=2, key_length=64, value_length=64,
+        native_ctx=32768, architecture="qwen2",
+        runtime="mlx", quant_label="4bit-g64",
+    )
+
+
+def test_calibration_from_bench_tags_runtime():
+    spec = _mlx_qwen_0_5b()
+    bench = BenchResult(pp_tok_s=2010.0, tg_tok_s=88.7)
+    calib = calibration_from_bench(bench, spec, "Apple M1", "mlx_lm", runtime="mlx")
+    assert calib.runtime == "mlx"
+    assert calib.source == "mlx_lm"
+
+
+def test_calibration_default_runtime_is_gguf():
+    """Backward-compat: existing callers that don't pass `runtime=` get gguf."""
+    spec = ModelSpec(
+        repo_id="x", quant="Q4_K_M", total_weight_bytes=1, active_weight_bytes=1,
+        total_params=494_000_000, n_layers=1, n_kv_heads=1, key_length=64, value_length=64,
+        native_ctx=2048, architecture="qwen2",
+    )
+    calib = calibration_from_bench(BenchResult(pp_tok_s=100.0, tg_tok_s=10.0),
+                                   spec, "Apple M1", "llama-bench")
+    assert calib.runtime == "gguf"
+
+
+def test_mlx_calibration_round_trips_for_mlx_spec(any_profile):
+    """Mirror the gguf round-trip but for an MLX spec + MLX-tagged calibration."""
+    spec = _mlx_qwen_0_5b()
+    gen_ctx = 64
+    bench = BenchResult(pp_tok_s=2010.0, tg_tok_s=88.7)
+    calib = calibration_from_bench(bench, spec, "Apple M1", "mlx_lm",
+                                   gen_ctx=gen_ctx, runtime="mlx")
+    recovered = decode_tok_s(any_profile, spec, gen_ctx, EstimatorConfig(), calibration=calib)
+    assert recovered == pytest.approx(88.7, rel=1e-9)
+
+
+# --------------------------------------------------------------------------- #
+# Estimator runtime-guard: a calibration tagged for one runtime must not
+# leak into a spec tagged for a different runtime.
+# --------------------------------------------------------------------------- #
+def test_mlx_calibration_does_not_apply_to_gguf_spec(qwen_0_5b, any_profile):
+    """MLX-measured constants on a GGUF target would silently mislead. Guard
+    drops the calibration; decode falls back to the static estimate."""
+    mlx_calib = Calibration(
+        effective_bytes_per_sec=99e9,  # absurdly fast — would dominate if applied
+        measured_on_chip="Apple M1", source="mlx_lm", runtime="mlx",
+    )
+    static = decode_tok_s(any_profile, qwen_0_5b, 64, EstimatorConfig(), calibration=None)
+    guarded = decode_tok_s(any_profile, qwen_0_5b, 64, EstimatorConfig(), calibration=mlx_calib)
+    assert guarded == pytest.approx(static, rel=1e-9)
+
+
+def test_gguf_calibration_does_not_apply_to_mlx_spec(any_profile):
+    spec = _mlx_qwen_0_5b()
+    gguf_calib = Calibration(
+        effective_bytes_per_sec=99e9, measured_on_chip="Apple M1",
+        source="llama-bench", runtime="gguf",
+    )
+    static = decode_tok_s(any_profile, spec, 64, EstimatorConfig(), calibration=None)
+    guarded = decode_tok_s(any_profile, spec, 64, EstimatorConfig(), calibration=gguf_calib)
+    assert guarded == pytest.approx(static, rel=1e-9)
+
+
+def test_gguf_calibration_does_apply_to_ollama_spec(qwen_0_5b, any_profile):
+    """Ollama IS gguf physics — a llama-bench calibration must apply."""
+    ollama_spec = ModelSpec(
+        repo_id="llama3.1:8b", quant="Q4_K_M", total_weight_bytes=qwen_0_5b.total_weight_bytes,
+        active_weight_bytes=qwen_0_5b.active_weight_bytes, total_params=qwen_0_5b.total_params,
+        n_layers=qwen_0_5b.n_layers, n_kv_heads=qwen_0_5b.n_kv_heads,
+        key_length=qwen_0_5b.key_length, value_length=qwen_0_5b.value_length,
+        native_ctx=qwen_0_5b.native_ctx, architecture=qwen_0_5b.architecture,
+        runtime="ollama", quant_label="Q4_K_M",
+    )
+    calib = calibration_from_bench(BenchResult(pp_tok_s=2010.0, tg_tok_s=88.7),
+                                   qwen_0_5b, "Apple M1", "llama-bench", runtime="gguf")
+    recovered = decode_tok_s(any_profile, ollama_spec, 64, EstimatorConfig(), calibration=calib)
+    assert recovered == pytest.approx(88.7, rel=1e-9)
+
+
+def test_estimate_speed_notes_when_cross_runtime_calibration_dropped(qwen_0_5b, any_profile):
+    """When a calibration is provided but ignored due to runtime mismatch, the
+    SpeedResult must say so (confidence stays 'estimated', not 'measured')."""
+    mlx_calib = Calibration(
+        effective_bytes_per_sec=99e9, measured_on_chip="Apple M1",
+        source="mlx_lm", runtime="mlx",
+    )
+    result = estimate_speed(any_profile, qwen_0_5b, EstimatorConfig(), calibration=mlx_calib)
+    assert result.confidence == "estimated"
+    assert any("'mlx'" in n and "'gguf'" in n and "ignoring" in n for n in result.notes)
