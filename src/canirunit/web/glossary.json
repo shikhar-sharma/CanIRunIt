@@ -1,0 +1,30 @@
+{
+  "fit-vs-speed": {
+    "title": "Will it fit vs. will it run fast",
+    "body": "Two different questions with different reliability. Fit is deterministic — the tool can tell you exactly how much memory the weights and KV cache will occupy. Speed is estimated — real throughput depends on kernel quality, thermal state, and build flags. Calibrate to trade the estimate for a measurement on your machine."
+  },
+  "kv-cache": {
+    "title": "KV cache",
+    "body": "The attention cache. It grows linearly with context length, and for long-context models it can rival or exceed the weight bytes. That's why a model that loads happily at 4K may not at 64K, and why KV-quant is a separate lever from weight quant."
+  },
+  "decode-bandwidth": {
+    "title": "Decode = memory bandwidth ÷ bytes read per token",
+    "body": "Generating each new token means reading the entire active weight + the entire KV cache from memory once. So tok/s ≈ bandwidth / (weights + KV). KV grows with context, so speed drops as context fills. This is why decode is called memory-bandwidth-bound."
+  },
+  "prefill-compute": {
+    "title": "Prefill / TTFT is compute-bound",
+    "body": "Processing the prompt (first token latency) reads weights once but does a full matmul against the whole prompt. It's compute-bound rather than bandwidth-bound, so it scales with FLOP/s. TTFT is the rougher of the two estimates because the FLOP/s table is coarse — calibration is what fixes it."
+  },
+  "working-set": {
+    "title": "Working set / usable memory",
+    "body": "On Apple Silicon the Metal working set (~75% of unified memory) is the wired ceiling for GPU allocation. It's a soft cap: macOS extends it via memory compression and swap, at a throughput cost. That's why the tool shows two ceilings on Apple. On CUDA the VRAM cap is a hard wall — no soft/hard distinction."
+  },
+  "quantization": {
+    "title": "Weight quant vs. KV quant",
+    "body": "Weight quant (Q4_K_M, Q8_0, ...) trades size for quality — smaller quant means smaller weights and lower quality. KV-cache quant (f16 / q8 / q4) trades the KV footprint separately. Dropping KV to q4 quarters the KV bytes at the same context, often enough to reach native context on a machine where f16 wouldn't."
+  },
+  "estimated-vs-measured": {
+    "title": "Estimated vs measured",
+    "body": "Estimates come from spec-sheet bandwidth and FLOP/s. They're in the right ballpark but can miss by 20–40% because they don't know your kernel quality, thermal state, or build flags. Calibration runs a small bench model through your actual runtime, times it, and inverts the estimator's math to recover your machine's real numbers. Trust the measured curve; the estimated one is a starting point."
+  }
+}

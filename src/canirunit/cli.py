@@ -363,6 +363,35 @@ def run_models(
 
 
 # --------------------------------------------------------------------------- #
+# Orchestration: serve (blocks; returns process exit code)
+# --------------------------------------------------------------------------- #
+def _run_serve(host: str, port: int, open_browser: bool) -> int:
+    try:
+        from .server import create_app
+    except ImportError:
+        print(
+            "canirunit: the web UI extras aren't installed.\n"
+            "  pip install 'canirunit[ui]'\n"
+            "and try `canirunit serve` again.",
+            file=sys.stderr,
+        )
+        return 1
+    import uvicorn
+
+    app = create_app()
+    url = f"http://{host}:{port}/"
+    if open_browser:
+        import threading
+        import webbrowser
+
+        # Delay opening so uvicorn is listening by the time the browser hits it.
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    print(f"canirunit: serving at {url}  (Ctrl-C to stop)")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
 # Argument parsing
 # --------------------------------------------------------------------------- #
 def build_parser() -> argparse.ArgumentParser:
@@ -394,6 +423,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("refresh", help="Pull the latest published alias table into the local overlay.")
     sub.add_parser("models", help="List the known model aliases (shipped + any overlay).")
+
+    serve = sub.add_parser("serve", help="Launch the local web UI on http://127.0.0.1:8765/")
+    serve.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    serve.add_argument("--port", type=int, default=8765, help="Bind port (default: 8765)")
+    serve.add_argument("--no-browser", action="store_true", help="Do not open a browser window")
     return p
 
 
@@ -418,6 +452,8 @@ def main(argv: Optional[list] = None) -> int:
             report = run_refresh()
         elif args.command == "models":
             report = run_models()
+        elif args.command == "serve":
+            return _run_serve(host=args.host, port=args.port, open_browser=not args.no_browser)
         else:
             return 1
     except (ValueError, KeyError) as e:

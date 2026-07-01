@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>canirunit</title>
+  <link rel="stylesheet" href="vendor/uPlot.min.css">
+  <link rel="stylesheet" href="styles.css">
+  <script src="vendor/uPlot.iife.min.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <h1>canirunit</h1>
+      <p class="subtitle">Will this model fit? How fast will it run?</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <!-- A. Machine panel -->
+    <section id="machine-panel" class="panel">
+      <h2>Machine</h2>
+      <div id="machine-content" class="pending">Detecting hardware…</div>
+    </section>
+
+    <!-- B. Model picker -->
+    <section id="picker-panel" class="panel">
+      <h2>Model</h2>
+      <div class="picker-controls">
+        <input type="search" id="model-search" placeholder="Search models…" autocomplete="off">
+        <select id="model-select" size="8" aria-label="Model list"></select>
+      </div>
+      <p class="picker-hint">
+        Don't see your model?
+        <button id="refresh-btn" type="button" class="link-btn">Refresh model list</button>
+        to pull the latest.
+      </p>
+      <details id="advanced-picker">
+        <summary>Advanced: use a specific repo id / Ollama tag</summary>
+        <div class="advanced-fields">
+          <input type="text" id="advanced-ref" placeholder="e.g. bartowski/Meta-Llama-3.1-8B-Instruct-GGUF">
+          <select id="advanced-runtime" aria-label="Runtime">
+            <option value="gguf">GGUF</option>
+            <option value="mlx">MLX</option>
+            <option value="ollama">Ollama</option>
+          </select>
+          <button id="advanced-check" type="button">Check</button>
+        </div>
+      </details>
+    </section>
+
+    <!-- C. Fit summary -->
+    <section id="fit-panel" class="panel">
+      <h2>Fit</h2>
+      <div id="fit-content" class="empty">Pick a model to see whether it fits.</div>
+    </section>
+
+    <!-- F. Quantization controls (top of the curves block for accessibility) -->
+    <section id="quant-panel" class="panel" hidden>
+      <h2>Quantization</h2>
+      <div class="quant-controls">
+        <label>
+          <span class="lbl">Weight quant</span>
+          <select id="weight-quant" aria-label="Weight quant">
+            <option value="Q2_K">Q2_K</option>
+            <option value="Q3_K_S">Q3_K_S</option>
+            <option value="Q3_K_M">Q3_K_M</option>
+            <option value="Q3_K_L">Q3_K_L</option>
+            <option value="Q4_0">Q4_0</option>
+            <option value="Q4_K_S">Q4_K_S</option>
+            <option value="Q4_K_M" selected>Q4_K_M</option>
+            <option value="Q5_K_S">Q5_K_S</option>
+            <option value="Q5_K_M">Q5_K_M</option>
+            <option value="Q6_K">Q6_K</option>
+            <option value="Q8_0">Q8_0</option>
+          </select>
+        </label>
+        <label>
+          <span class="lbl">KV quant</span>
+          <select id="kv-quant" aria-label="KV cache quant">
+            <option value="f16" selected>f16 (default)</option>
+            <option value="q8">q8 (~half)</option>
+            <option value="q4">q4 (~quarter)</option>
+          </select>
+        </label>
+      </div>
+      <p class="quant-hint">
+        Weight quant is intrinsic on MLX and Ollama (set by the repo/tag). KV
+        quant is a separate lever — dropping it to q4 often unlocks the full
+        native context.
+      </p>
+    </section>
+
+    <!-- D. KV-cache curve -->
+    <section id="kv-curve-panel" class="panel" hidden>
+      <h2>Memory vs. context</h2>
+      <div id="kv-curve-chart" class="uplot-wrap"></div>
+      <p class="chart-caption">
+        Weights are constant; KV cache grows linearly with context. The
+        <em>comfort</em> line is what fits without spilling; the <em>hard</em>
+        line (Apple only) is what still loads via compression/swap, slower.
+      </p>
+    </section>
+
+    <!-- E. Decode-decay curve -->
+    <section id="decode-curve-panel" class="panel" hidden>
+      <h2>Decode speed vs. context</h2>
+      <div id="decode-curve-chart" class="uplot-wrap"></div>
+      <p class="chart-caption" id="decode-caption">
+        Decode is memory-bandwidth-bound. As KV grows the per-token bytes
+        read grow with it, so speed drops. Dashed = estimated; solid =
+        measured (after calibration).
+      </p>
+      <div id="calib-controls" class="calib-controls">
+        <button id="calib-btn" type="button">Calibrate this runtime</button>
+        <span id="calib-status" class="calib-status"></span>
+      </div>
+    </section>
+
+    <!-- G. Comparison across runtimes -->
+    <section id="compare-panel" class="panel" hidden>
+      <div class="section-header">
+        <h2>Compare across runtimes</h2>
+        <button id="compare-refresh-btn" type="button" class="link-btn">Refresh</button>
+      </div>
+      <div id="compare-content" class="empty">
+        Comparison runs against every runtime declared in the alias entry.
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap">
+      <span>canirunit — local tool. Bound to 127.0.0.1.</span>
+    </div>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
