@@ -481,3 +481,14 @@ def test_api_routes_still_work_alongside_static_mount(client):
     tc, _, _ = client
     assert tc.get("/api/system").status_code == 200
     assert tc.get("/api/models").status_code == 200
+
+
+def test_vendored_uplot_is_served(client):
+    """uPlot is checked in under web/vendor/. The static mount should serve it."""
+    tc, _, _ = client
+    r = tc.get("/vendor/uPlot.iife.min.js")
+    assert r.status_code == 200
+    assert "uPlot" in r.text
+    css = tc.get("/vendor/uPlot.min.css")
+    assert css.status_code == 200
+    assert css.headers["content-type"].startswith("text/css")

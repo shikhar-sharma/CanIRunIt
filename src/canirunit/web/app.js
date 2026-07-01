@@ -13,9 +13,16 @@ const state = {
   selection: {
     model: null,       // logical id OR raw ref (Advanced path)
     runtime: "gguf",
+    quant: "Q4_K_M",   // weight quant (GGUF only; other runtimes ignore it)
+    kv_quant: "f16",   // KV cache element quant
   },
   lastCheck: null,     // whole /api/check response for the current selection
+  charts: { kv: null, decode: null },
 };
+
+// Debounce delay for control changes -> /api/check re-fetch. Signed off in
+// the spec discussion.
+const CONTROL_DEBOUNCE_MS = 250;
 
 // --------------------------------------------------------------------------
 // API wrappers — normalize error handling so callers don't have to think
@@ -193,7 +200,7 @@ async function onRefreshClick() {
 // C. Fit summary — from /api/check
 // --------------------------------------------------------------------------
 async function onSelectionChanged() {
-  const { model, runtime } = state.selection;
+  const { model, runtime, quant, kv_quant } = state.selection;
   if (!model) return;
 
   const fitEl = document.getElementById("fit-content");
@@ -202,15 +209,33 @@ async function onSelectionChanged() {
   fitEl.textContent = "Fetching model details…";
 
   try {
-    const resp = await API.check({ model, runtime });
+    const resp = await API.check({ model, runtime, quant, kv_quant });
     state.lastCheck = resp;
     fitEl.classList.remove("pending");
     renderFit(resp);
+    // Reveal the quant controls + curves once we have data.
+    document.getElementById("quant-panel").hidden = false;
+    document.getElementById("kv-curve-panel").hidden = false;
+    document.getElementById("decode-curve-panel").hidden = false;
+    reconcileQuantControls(resp);
+    renderKVCurve(resp);
+    renderDecodeCurve(resp);
   } catch (err) {
     fitEl.classList.remove("pending");
     fitEl.classList.add("error");
     fitEl.textContent = `Error: ${err.message}`;
   }
+}
+
+// The debounced re-check invoked when a quant control changes. Coalesces
+// rapid changes (dropdown clicks in a row) into one server call.
+let _controlDebounceTimer = null;
+function scheduleRecheck() {
+  clearTimeout(_controlDebounceTimer);
+  _controlDebounceTimer = setTimeout(() => {
+    _controlDebounceTimer = null;
+    onSelectionChanged();
+  }, CONTROL_DEBOUNCE_MS);
 }
 
 function renderFit(resp) {
@@ -286,8 +311,194 @@ function legendChip(cls, label, isCeiling = false) {
 }
 
 // --------------------------------------------------------------------------
+// F. Quantization controls
+// --------------------------------------------------------------------------
+function wireQuantControls() {
+  const weight = document.getElementById("weight-quant");
+  const kv = document.getElementById("kv-quant");
+  weight.addEventListener("change", (e) => {
+    state.selection.quant = e.target.value;
+    scheduleRecheck();
+  });
+  kv.addEventListener("change", (e) => {
+    state.selection.kv_quant = e.target.value;
+    scheduleRecheck();
+  });
+}
+
+function reconcileQuantControls(resp) {
+  // Weight quant is meaningful only for GGUF; MLX and Ollama bake it into
+  // the repo/tag. Disable the control on the other runtimes and label it
+  // with the intrinsic quant that came back so the user isn't confused.
+  const runtime = resp.spec.runtime;
+  const weight = document.getElementById("weight-quant");
+  if (runtime === "gguf") {
+    weight.disabled = false;
+    weight.title = "";
+  } else {
+    weight.disabled = true;
+    weight.title = `intrinsic to ${runtime} — set by the repo/tag (${resp.spec.quant_label || resp.spec.quant})`;
+  }
+  document.getElementById("kv-quant").value = state.selection.kv_quant;
+}
+
+// --------------------------------------------------------------------------
+// D. KV-cache curve  (uPlot)
+// --------------------------------------------------------------------------
+function renderKVCurve(resp) {
+  const container = document.getElementById("kv-curve-chart");
+  container.replaceChildren();      // wipe any prior plot
+
+  const { memory_curve } = resp;
+  const points = memory_curve.points;
+  const xs = points.map((p) => p.ctx);
+  // uPlot needs y-series aligned with x. Y in GB for readability.
+  const toGB = (b) => b / 1e9;
+  const weights = points.map(() => toGB(memory_curve.weight_bytes));
+  const withKV = points.map((p) => toGB(memory_curve.weight_bytes + p.kv_bytes));
+  const withOverhead = points.map((p) => toGB(memory_curve.weight_bytes + p.kv_bytes + memory_curve.overhead_bytes));
+
+  const comfortGB = toGB(memory_curve.usable_bytes);
+  const hardGB = memory_curve.hard_usable_bytes != null ? toGB(memory_curve.hard_usable_bytes) : null;
+
+  const opts = {
+    width: container.clientWidth || 720,
+    height: 260,
+    scales: {
+      x: { time: false },
+      y: { auto: true },
+    },
+    axes: [
+      { label: "Context (tokens)", labelSize: 24 },
+      { label: "Memory (GB)", labelSize: 34, size: 60 },
+    ],
+    series: [
+      { label: "Context" },
+      { label: "Weights",        stroke: getVar("--weight"),   fill: getVar("--weight"), width: 1, points: { show: false } },
+      { label: "Weights + KV",   stroke: getVar("--kv"),       fill: getVar("--kv"),     width: 1, points: { show: false } },
+      { label: "Total (+overhead)", stroke: getVar("--overhead"), width: 1, points: { show: false } },
+    ],
+    hooks: {
+      // Draw comfort + hard ceilings and the max-ctx marker on top of the plot.
+      draw: [
+        (u) => drawCeilingLines(u, comfortGB, hardGB),
+        (u) => drawMaxCtxMarker(u, resp.fit.max_ctx_that_fits),
+      ],
+    },
+  };
+
+  state.charts.kv = new uPlot(opts, [xs, weights, withKV, withOverhead], container);
+}
+
+function drawCeilingLines(u, comfortGB, hardGB) {
+  const ctx = u.ctx;
+  const { left, top, width, height } = u.bbox;
+  const drawLine = (yVal, color, dash) => {
+    if (yVal == null) return;
+    const y = u.valToPos(yVal, "y", true);
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    if (dash) ctx.setLineDash(dash);
+    ctx.beginPath();
+    ctx.moveTo(left, y);
+    ctx.lineTo(left + width, y);
+    ctx.stroke();
+    ctx.restore();
+    // Small right-side label
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.font = "10px system-ui, -apple-system, sans-serif";
+    ctx.textAlign = "right";
+    ctx.fillText(dash ? "hard" : "comfort", left + width - 4, y - 4);
+    ctx.restore();
+  };
+  drawLine(comfortGB, getVar("--comfort"), null);
+  if (hardGB != null) drawLine(hardGB, getVar("--hard"), [4, 3]);
+}
+
+function drawMaxCtxMarker(u, maxCtx) {
+  if (!maxCtx || maxCtx <= 0) return;
+  const ctx = u.ctx;
+  const { top, height } = u.bbox;
+  const x = u.valToPos(maxCtx, "x", true);
+  ctx.save();
+  ctx.strokeStyle = getVar("--accent");
+  ctx.lineWidth = 1;
+  ctx.setLineDash([2, 3]);
+  ctx.beginPath();
+  ctx.moveTo(x, top);
+  ctx.lineTo(x, top + height);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = getVar("--accent");
+  ctx.font = "10px system-ui, -apple-system, sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(`max ctx: ${maxCtx.toLocaleString()}`, x + 4, top + 12);
+  ctx.restore();
+}
+
+// --------------------------------------------------------------------------
+// E. Decode-decay curve  (uPlot)
+// --------------------------------------------------------------------------
+function renderDecodeCurve(resp) {
+  const container = document.getElementById("decode-curve-chart");
+  container.replaceChildren();
+
+  const points = resp.speed.points;
+  const xs = points.map((p) => p.ctx);
+  const decode = points.map((p) => p.decode_tok_s);
+  const measured = resp.speed.confidence === "measured";
+
+  const opts = {
+    width: container.clientWidth || 720,
+    height: 220,
+    scales: { x: { time: false }, y: { auto: true } },
+    axes: [
+      { label: "Context (tokens)", labelSize: 24 },
+      { label: "Decode (tok/s)", labelSize: 34, size: 60 },
+    ],
+    series: [
+      { label: "Context" },
+      {
+        label: measured ? "Decode (measured)" : "Decode (estimated)",
+        stroke: measured ? getVar("--accent") : getVar("--text-dim"),
+        width: measured ? 2 : 1.5,
+        dash: measured ? null : [4, 3],
+        points: { show: true, size: 4, stroke: measured ? getVar("--accent") : getVar("--text-dim") },
+      },
+    ],
+  };
+
+  state.charts.decode = new uPlot(opts, [xs, decode], container);
+
+  // Update caption + verdict styling to match confidence.
+  const cap = document.getElementById("decode-caption");
+  cap.classList.toggle("measured", measured);
+  cap.classList.toggle("estimated", !measured);
+}
+
+function getVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// Resize handler: uPlot doesn't reflow on its own. Debounce so we don't
+// tear down / rebuild on every resize event.
+let _resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(() => {
+    if (state.lastCheck) {
+      renderKVCurve(state.lastCheck);
+      renderDecodeCurve(state.lastCheck);
+    }
+  }, 120);
+});
+
+// --------------------------------------------------------------------------
 // Boot
 // --------------------------------------------------------------------------
 wirePicker();
+wireQuantControls();
 renderMachine();
 loadModels();
